@@ -1,10 +1,14 @@
 # ═══════════════════════════════════════════════════════════════════════════
-#  RDP FABRIC v5.2 FINAL — application-focused, Edge auto-open, minutes timer
-#  Pure Tailscale · Self-healing hold loop · Runtime bootstrap · Crash dumps
+#  RDP FABRIC v6.0 FINAL — modular, application-focused
+#     .github/workflows/rdp-fabric.yml    ← orchestration (this file)
+#     .github/scripts/fabric-timer.ps1    ← countdown overlay
+#     .github/scripts/fabric-browser.ps1  ← auto-open site in Edge
 #
-#  FILES:
-#     .github/workflows/rdp-fabric.yml    ← this file
-#     .github/scripts/fabric-timer.ps1    ← countdown overlay (checked out + copied)
+#  FIXES the "app opens a terminal then closes" class:
+#     • VC++ 2008–2015+ / DirectX 9 / .NET 6-7-8 Desktop / WebView2 / 7-Zip
+#     • WER minidumps → Drop\CrashDumps (so you SEE why an app died)
+#     • MOTW stripped every 60s · UAC/SmartScreen/AppCompat off
+#     • TermService pinned · RDP auto-heal · Tailscale re-up
 # ═══════════════════════════════════════════════════════════════════════════
 
 name: "RDP Fabric (Pure Tailscale)"
@@ -13,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       runner_image:
-        description: "Runner label. windows-latest = 4c/16GB (public). Use an 8c/32GB+ self-hosted label for heavy software."
+        description: "Runner label. windows-latest = 4c/16GB. Use an 8c/32GB+ self-hosted label for heavy software."
         required: false
         default: "windows-latest"
       instance_count:
@@ -53,13 +57,13 @@ on:
         type: boolean
         default: false
       rdp_compression:
-        description: "RDP wire compression. auto = off on direct path, on when relayed"
+        description: "RDP wire compression. auto = off direct, on relayed"
         required: false
         default: "auto"
         type: choice
         options: ["auto", "on", "off"]
       reclaim_disk:
-        description: "Reclaim temp/update/delivery-optimization caches so pagefile + payloads fit"
+        description: "Reclaim temp/update caches so pagefile + payloads fit"
         type: boolean
         default: true
       disable_mitigations:
@@ -69,6 +73,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 defaults:
   run:
@@ -116,8 +121,8 @@ jobs:
       STARTUP_URL: ${{ inputs.startup_url }}
 
     steps:
-      # ── CHECKOUT (timer + helper scripts) ──────────────────────────────
-      - name: "Checkout Repo (timer script)"
+      # ── CHECKOUT: pulls timer + browser helper scripts ─────────────────
+      - name: "Checkout Repo (helper scripts)"
         uses: actions/checkout@v4
 
       # ── 0. INVENTORY + STATE + BACKGROUND TS DOWNLOAD ───────────────────
@@ -125,7 +130,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Continue'
           $ProgressPreference = 'SilentlyContinue'
-          Write-Host "FABRIC v5.2 — application-focused bring-up" -ForegroundColor Cyan
+          Write-Host "FABRIC v6.0 — application-focused bring-up" -ForegroundColor Cyan
 
           $runtime = [int]"${{ inputs.runtime_minutes }}"
           if ("${{ inputs.quick_test }}" -eq "true") { $runtime = 5 }
@@ -139,12 +144,12 @@ jobs:
 
           $os  = Get-CimInstance Win32_OperatingSystem
           $cs  = Get-CimInstance Win32_ComputerSystem
-          $ramGB      = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
-          $freeRamGB  = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
-          $cpuCount   = [int]$cs.NumberOfLogicalProcessors
+          $ramGB     = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
+          $freeRamGB = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
+          $cpuCount  = [int]$cs.NumberOfLogicalProcessors
           if ($cpuCount -le 0) { $cpuCount = [Environment]::ProcessorCount }
-          $cpuCores   = [int]$cs.NumberOfProcessors
-          $cpuName    = [string]$cs.Name
+          $cpuCores  = [int]$cs.NumberOfProcessors
+          $cpuName   = [string]$cs.Name
           if (-not $cpuName) { $cpuName = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name }
 
           $sysLetter = $env:SystemDrive.TrimEnd(':')
@@ -181,7 +186,7 @@ jobs:
           else                            { $pagefileMult = 1.25 }
 
           $state = [ordered]@{
-              version='5.2'; minutes=$runtime; deadline=$deadlineStr
+              version='6.0'; minutes=$runtime; deadline=$deadlineStr
               data_root=$dataRoot; fab_root=$env:FABRIC_ROOT; user=$env:RDP_USER
               profile=$profile; ram_gb=$ramGB; free_ram_gb=$freeRamGB
               cpu=$cpuCount; cpu_cores=$cpuCores; cpu_name=$cpuName
@@ -476,7 +481,7 @@ jobs:
           $pfMult = [double]($(if ($env:FABRIC_PF_MULT) { $env:FABRIC_PF_MULT } else { 2 }))
 
           if ("$env:RECLAIM_DISK" -eq "true") {
-              Write-Host "Reclaiming cheap temp (no CompactOS, no SoftwareDistribution walk)..." -ForegroundColor Cyan
+              Write-Host "Reclaiming cheap temp..." -ForegroundColor Cyan
               try { Disable-WindowsErrorReporting -ErrorAction SilentlyContinue | Out-Null } catch {}
               @("$env:SystemRoot\Temp\*", "$env:SystemRoot\Minidump\*", "$env:SystemDrive\Windows\MEMORY.DMP") |
                   ForEach-Object { Remove-Item -Path $_ -Force -ErrorAction SilentlyContinue }
@@ -518,9 +523,8 @@ jobs:
               if (-not (Wait-Job $job -Timeout 20)) {
                   Stop-Job $job -ErrorAction SilentlyContinue
                   Write-Host "Live pagefile add timed out (20s) — C: system file stays in use." -ForegroundColor Yellow
-              } else {
-                  if ($job.State -eq 'Completed') { Write-Host "Added live pagefile ${targetMB} MB on $pfPath (C: kept)." -ForegroundColor Green }
-                  else { Write-Host "Live pagefile add skipped." -ForegroundColor Yellow }
+              } elseif ($job.State -eq 'Completed') {
+                  Write-Host "Added live pagefile ${targetMB} MB on $pfPath (C: kept)." -ForegroundColor Green
               }
               Remove-Job $job -Force -ErrorAction SilentlyContinue
           }
@@ -621,7 +625,7 @@ jobs:
           Write-Host "==========================================" -ForegroundColor Cyan
           $tgMarker = Join-Path $env:FABRIC_ROOT 'telegram.sent'
           if ($env:TG_TOKEN -and $env:TG_CHAT -and -not (Test-Path -LiteralPath $tgMarker)) {
-              $msg = "⚡ <b>Fabric Node Online v5.2</b>`n`n🖥 <b>Host:</b> <code>$hostname</code>`n🌐 <b>IP:</b> <code>$ip</code>`n🔗 <b>Path:</b> <code>$linkNow</code>`n👤 <b>User:</b> <code>$env:RDP_USER</code>`n🧠 <b>Profile:</b> <code>$env:FABRIC_PROFILE</code>`n⚙️ <b>HW:</b> <code>$env:FABRIC_CPU CPU / $env:FABRIC_RAM_GB GB</code>`n⏳ <b>Duration:</b> <code>$env:SESSION_MINUTES</code> min`n📁 <b>Drop:</b> <code>$dataRootNow\Drop</code>"
+              $msg = "⚡ <b>Fabric Node Online v6</b>`n`n🖥 <b>Host:</b> <code>$hostname</code>`n🌐 <b>IP:</b> <code>$ip</code>`n🔗 <b>Path:</b> <code>$linkNow</code>`n👤 <b>User:</b> <code>$env:RDP_USER</code>`n🧠 <b>Profile:</b> <code>$env:FABRIC_PROFILE</code>`n⚙️ <b>HW:</b> <code>$env:FABRIC_CPU CPU / $env:FABRIC_RAM_GB GB</code>`n⏳ <b>Duration:</b> <code>$env:SESSION_MINUTES</code> min`n📁 <b>Drop:</b> <code>$dataRootNow\Drop</code>"
               try {
                   Invoke-RestMethod -Uri "https://api.telegram.org/bot$($env:TG_TOKEN)/sendMessage" -Method Post -Body @{chat_id=$env:TG_CHAT; text=$msg; parse_mode="HTML"} -TimeoutSec 15 | Out-Null
                   Set-Content -Path $tgMarker -Value (Get-Date -Format o) -Encoding ASCII
@@ -709,7 +713,7 @@ jobs:
           } catch {}
 
           $status = [ordered]@{
-              version='5.2'; host=$hostname; ip=$ip; path=$(if ($direct) { 'direct' } else { 'DERP relay' })
+              version='6.0'; host=$hostname; ip=$ip; path=$(if ($direct) { 'direct' } else { 'DERP relay' })
               user=$env:RDP_USER; minutes=if ($env:SESSION_MINUTES) { [int]$env:SESSION_MINUTES } else { $null }
               deadline=$env:SESSION_DEADLINE; profile=$env:FABRIC_PROFILE; ram_gb=$env:FABRIC_RAM_GB
               cpu=$env:FABRIC_CPU; rdp_comp=$wantComp; startup_url=$env:STARTUP_URL
@@ -728,14 +732,8 @@ jobs:
           try {
               Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True -DefaultInboundAction Block -DefaultOutboundAction Allow -ErrorAction SilentlyContinue
               Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
-              New-NetFirewallRule -DisplayName "Fabric-HTTPS-Out" -Direction Outbound -Protocol TCP -RemotePort 443 -Action Allow -ErrorAction SilentlyContinue | Out-Null
-              New-NetFirewallRule -DisplayName "Fabric-HTTP-Out"  -Direction Outbound -Protocol TCP -RemotePort 80  -Action Allow -ErrorAction SilentlyContinue | Out-Null
-              New-NetFirewallRule -DisplayName "Fabric-DNS-Out"   -Direction Outbound -Protocol UDP -RemotePort 53  -Action Allow -ErrorAction SilentlyContinue | Out-Null
           } catch {}
-
           try { Set-MpPreference -EnableNetworkProtection Disabled -PUAProtection Disabled -EnableControlledFolderAccess Disabled -Force -ErrorAction SilentlyContinue } catch {}
-          New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\Network Protection" -Force | Out-Null
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\Network Protection" -Name "EnableNetworkProtection" -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
 
           Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters" -Name "DisabledComponents" -Value 0x20 -Type DWord -Force -ErrorAction SilentlyContinue
           foreach ($feat in @('Teredo','6to4','isatap')) { try { netsh interface $feat set state disabled | Out-Null } catch {} }
@@ -756,14 +754,10 @@ jobs:
               New-Item -Path $ie -Force | Out-Null
               Set-ItemProperty -Path $ie -Name "CertificateRevocation" -Value 0 -Type DWord -Force
               Set-ItemProperty -Path $ie -Name "SecureProtocols" -Value 0x2800 -Type DWord -Force
-              Set-ItemProperty -Path $ie -Name "EnableHttp1_1" -Value 1 -Type DWord -Force
-              Set-ItemProperty -Path $ie -Name "EnableNegotiate" -Value 1 -Type DWord -Force
               Set-ItemProperty -Path $ie -Name "MaxConnectionsPerServer" -Value 128 -Type DWord -Force
               Set-ItemProperty -Path $ie -Name "MaxConnectionsPer1_0Server" -Value 128 -Type DWord -Force
               Set-ItemProperty -Path $ie -Name "ProxyEnable" -Value 0 -Type DWord -Force
           }
-          Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings" -Name "ProxyServer" -Force -ErrorAction SilentlyContinue
-          Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings" -Name "AutoConfigURL" -Force -ErrorAction SilentlyContinue
 
           $winhttp = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\WinHttp"
           New-Item -Path $winhttp -Force | Out-Null
@@ -788,15 +782,6 @@ jobs:
                   Set-ItemProperty -Path $p -Name "Enabled" -Value 0 -Type DWord -Force
               }
           }
-
-          $tcpParams = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
-          Set-ItemProperty -Path $tcpParams -Name "SynAttackProtect" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path $tcpParams -Name "TcpNumConnections" -Value 16777214 -Type DWord -Force -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path $tcpParams -Name "KeepAliveTime" -Value 300000 -Type DWord -Force -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path $tcpParams -Name "KeepAliveInterval" -Value 1000 -Type DWord -Force -ErrorAction SilentlyContinue
-          try { netsh int tcp set global hystart=enabled | Out-Null } catch {}
-          try { netsh int tcp set global pacingprofile=off | Out-Null } catch {}
-          try { netsh winhttp reset proxy | Out-Null } catch {}
 
           $connXml = @'
           <system.net>
@@ -862,7 +847,7 @@ jobs:
                   $row.ms = $sw.ElapsedMilliseconds
               } catch { $row.error = $_.Exception.Message; $row.ms = $sw.ElapsedMilliseconds }
               $probe.results += $row
-              Write-Host ("HTTPS probe {0} {1} {2}ms {3}" -f $(if ($row.ok) { 'ok' } else { 'FAIL' }), $url, $row.ms, $row.error) -ForegroundColor $(if ($row.ok) { 'Green' } else { 'Yellow' })
+              Write-Host ("HTTPS probe {0} {1} {2}ms" -f $(if ($row.ok) { 'ok' } else { 'FAIL' }), $url, $row.ms) -ForegroundColor $(if ($row.ok) { 'Green' } else { 'Yellow' })
           }
           $probe | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $env:FABRIC_ROOT 'fabric-https.json') -Encoding UTF8
           Write-Host "High-concurrency HTTPS stack applied." -ForegroundColor Green
@@ -941,8 +926,8 @@ jobs:
           "bootstrap done $(Get-Date -Format o)" | Out-File $log -Append
           Write-Host "Runtime bootstrap complete. Log: $log" -ForegroundColor Green
 
-      # ── 7. WORKSTATION MODE, EDGE AUTO-OPEN, TIMER, GOVERNOR, DUMPS ─────
-      - name: "Phase 7: Workstation Mode, Edge Auto-Open, Timer, Governor & Crash Dumps"
+      # ── 7. WORKSTATION MODE + INSTALL TIMER/BROWSER + DUMPS ─────────────
+      - name: "Phase 7: Workstation Mode, Timer & Browser Install, Crash Dumps"
         continue-on-error: true
         run: |
           $ErrorActionPreference = 'Continue'
@@ -992,7 +977,6 @@ jobs:
               icacls $p /grant "${env:RDP_USER}:(OI)(CI)F" /T /C /Q | Out-Null
               icacls $p /grant "Everyone:(OI)(CI)F" /T /C /Q | Out-Null
           }
-
           foreach ($dir in @($drop, "C:\Users\$env:RDP_USER\Desktop", "C:\Users\$env:RDP_USER\Downloads")) {
               Get-ChildItem -LiteralPath $dir -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
                   Unblock-File -LiteralPath $_.FullName -ErrorAction SilentlyContinue
@@ -1031,72 +1015,132 @@ jobs:
           '@
           Set-Content -Path (Join-Path $fabricRoot "Governor.ps1") -Value $gov -Encoding UTF8
 
-          # ══════════ UPDATE 1: AUTO-OPEN SITE IN EDGE (default browser) ══════════
-          $startupUrl = if ($env:STARTUP_URL) { $env:STARTUP_URL } else { "https://fabric-x-xi.vercel.app" }
-
-          $edgePol = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
-          New-Item -Path $edgePol -Force | Out-Null
-          New-ItemProperty -Path $edgePol -Name "RestoreOnStartup" -PropertyType DWord -Value 5 -Force | Out-Null
-          Remove-ItemProperty -Path $edgePol -Name "RestoreOnStartupURLs" -Force -ErrorAction SilentlyContinue
-          New-ItemProperty -Path $edgePol -Name "HomepageLocation" -PropertyType String -Value $startupUrl -Force | Out-Null
-          New-ItemProperty -Path $edgePol -Name "HomepageIsNewTabPage" -PropertyType DWord -Value 0 -Force | Out-Null
-          New-ItemProperty -Path $edgePol -Name "ShowHomeButton" -PropertyType DWord -Value 1 -Force | Out-Null
-          New-ItemProperty -Path $edgePol -Name "BookmarkBarEnabled" -PropertyType DWord -Value 1 -Force | Out-Null
-          $bookmarkJson = @(@{ toplevel_name = "RDP Fabric" }, @{ name = "Fabric App"; url = $startupUrl }) | ConvertTo-Json -Depth 10 -Compress
-          New-ItemProperty -Path $edgePol -Name "ManagedBookmarks" -PropertyType String -Value $bookmarkJson -Force | Out-Null
-
-          $urlContent = "[InternetShortcut]`r`nURL=$startupUrl`r`n"
-          foreach ($desk in @("C:\Users\Public\Desktop", "C:\Users\$env:RDP_USER\Desktop")) {
-              if (Test-Path $desk) { Set-Content -Path (Join-Path $desk "Fabric App.url") -Value $urlContent -Encoding ASCII -Force }
-          }
-
-          $edgeOpenPath = Join-Path $fabricRoot "EdgeOpen.ps1"
-          $edgeScript = @'
-          $ErrorActionPreference = 'Continue'
-          $mutex = New-Object System.Threading.Mutex($false, 'Local\RDPFabricEdgeOpenOnce')
-          if (-not $mutex.WaitOne(0)) { return }
-          $url  = '__URL__'
-          $root = '__ROOT__'
-          $hostPart = ([System.Uri]$url).Host
-          $lock = Join-Path $root '.edge-launched'
-          if (Test-Path -LiteralPath $lock) {
-              $age = (Get-Date) - (Get-Item -LiteralPath $lock).LastWriteTime
-              if ($age.TotalMinutes -lt 8) { return }
-          }
-          $edge = $null
-          foreach ($p in @(
-              "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
-              "${env:ProgramFiles}\Microsoft\Edge\Application\msedge.exe",
-              "$env:LOCALAPPDATA\Microsoft\Edge\Application\msedge.exe"
-          )) {
-              if (Test-Path -LiteralPath $p) { $edge = $p; break }
-          }
-          if (-not $edge) { return }
-          $already = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name -eq 'msedge.exe' -and $_.CommandLine -and $_.CommandLine -like "*$hostPart*" }
-          if ($already) { return }
-          Start-Process -FilePath $edge -ArgumentList @(
-              '--no-first-run',
-              '--no-default-browser-check',
-              '--disable-session-crashed-bubble',
-              '--disable-background-networking',
-              $url
-          )
-          Set-Content -Path $lock -Value (Get-Date -Format o) -Encoding ASCII
-          '@
-          $edgeScript = $edgeScript.Replace('__URL__', $startupUrl).Replace('__ROOT__', $fabricRoot)
-          Set-Content -Path $edgeOpenPath -Value $edgeScript -Encoding UTF8
-
           $taskUser = "$env:COMPUTERNAME\$env:RDP_USER"
-          $eAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$edgeOpenPath`""
-          $eTrigger = New-ScheduledTaskTrigger -AtLogOn -User $taskUser
-          $eTrigger.Delay = "PT8S"
-          $ePrin = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Limited
-          $eSet = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew
-          Register-ScheduledTask -TaskName "RDPFabric-EdgeOpen" -Action $eAction -Trigger $eTrigger -Principal $ePrin -Settings $eSet -Force | Out-Null
-          Write-Host "Edge auto-open armed → $startupUrl" -ForegroundColor Green
+          $lgAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$hkcuPath`""
 
-          # ---- HKCU desktop/visual tweaks at logon ----
+          # ═══ BROWSER AUTO-OPEN — copy repo script (fallback if missing) ═══
+          $startupUrl = if ($env:STARTUP_URL) { $env:STARTUP_URL } else { "https://fabric-x-xi.vercel.app" }
+          $browserPath = Join-Path $fabricRoot "BrowserOpen.ps1"
+          $browserSrc  = $null
+          foreach ($cand in @(
+              "$env:GITHUB_WORKSPACE\.github\scripts\fabric-browser.ps1",
+              "$env:GITHUB_WORKSPACE\fabric-browser.ps1"
+          )) { if (Test-Path -LiteralPath $cand -PathType Leaf) { $browserSrc = $cand; break } }
+          if ($browserSrc) {
+              Copy-Item -LiteralPath $browserSrc -Destination $browserPath -Force
+              Write-Host "Browser script installed from repo → $browserSrc" -ForegroundColor Green
+          } else {
+              Write-Host "fabric-browser.ps1 missing — writing built-in fallback." -ForegroundColor Yellow
+              @'
+              param($Url='https://fabric-x-xi.vercel.app', $Root='C:\ProgramData\RDPFabric')
+              $ErrorActionPreference='Continue'
+              if($Url -notmatch '^https?://'){ $Url="https://$Url" }
+              $m=New-Object System.Threading.Mutex($false,'Local\RDPFabricBrowserOpen'); if(-not $m.WaitOne(0)){return}
+              $hp=[string]$Url; try{$hp=([System.Uri]$Url).Host}catch{}
+              $lk=Join-Path $Root '.browser-launched'
+              if(Test-Path $lk){try{if(((Get-Date)-(Get-Item $lk).LastWriteTime).TotalMinutes -lt 8){return}}catch{}}
+              $br=$null;$bn=''
+              foreach($p in @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe","${env:ProgramFiles}\Microsoft\Edge\Application\msedge.exe","$env:LOCALAPPDATA\Microsoft\Edge\Application\msedge.exe")){if(Test-Path $p){$br=$p;$bn='msedge';break}}
+              if(-not $br){foreach($p in @("${env:ProgramFiles}\Google\Chrome\Application\chrome.exe","${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe")){if(Test-Path $p){$br=$p;$bn='chrome';break}}}
+              if(-not $br){return}
+              $pr=Get-CimInstance Win32_Process -Filter "Name='$bn.exe'" -ErrorAction SilentlyContinue|Where-Object{$_.CommandLine -and ($_.CommandLine -like "*$hp*")}
+              if($pr){return}
+              Start-Process -FilePath $br -ArgumentList @('--no-first-run','--no-default-browser-check',$Url)
+              Set-Content -Path $lk -Value (Get-Date -Format o) -Encoding ASCII
+              '@ | Set-Content -Path $browserPath -Encoding UTF8
+          }
+          $bAction  = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$browserPath`" -Url `"$startupUrl`" -Root `"$fabricRoot`""
+          $bTrigger = New-ScheduledTaskTrigger -AtLogOn -User $taskUser
+          $bTrigger.Delay = "PT8S"
+          $bPrin  = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Limited
+          $bSet   = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew
+          Register-ScheduledTask -TaskName "RDPFabric-BrowserOpen" -Action $bAction -Trigger $bTrigger -Principal $bPrin -Settings $bSet -Force | Out-Null
+          Write-Host "Browser auto-open armed → $startupUrl" -ForegroundColor Green
+
+          # ═══ TIMER — copy repo script (fallback if missing) ═══
+          $timerPath = Join-Path $fabricRoot "FabricTimer.ps1"
+          $timerLauncher = Join-Path $fabricRoot "FabricTimer.vbs"
+          $timerSrc  = $null
+          foreach ($cand in @(
+              "$env:GITHUB_WORKSPACE\.github\scripts\fabric-timer.ps1",
+              "$env:GITHUB_WORKSPACE\fabric-timer.ps1"
+          )) { if (Test-Path -LiteralPath $cand -PathType Leaf) { $timerSrc = $cand; break } }
+          if ($timerSrc) {
+              Copy-Item -LiteralPath $timerSrc -Destination $timerPath -Force
+              Write-Host "Timer installed from repo → $timerSrc" -ForegroundColor Green
+          } else {
+              Write-Host "fabric-timer.ps1 missing — writing built-in fallback." -ForegroundColor Yellow
+              @'
+              $ErrorActionPreference='Continue'
+              Add-Type -AssemblyName System.Windows.Forms
+              Add-Type -AssemblyName System.Drawing
+              $m=New-Object System.Threading.Mutex($false,'Local\RDPFabricTimerOverlay'); if(-not $m.WaitOne(0)){return}
+              $df='C:\ProgramData\RDPFabric\deadline.txt'; $script:dl=$null
+              if(Test-Path $df){try{$script:dl=[datetime]::Parse((Get-Content $df -Raw).Trim(),[System.Globalization.CultureInfo]::InvariantCulture,[System.Globalization.DateTimeStyles]::RoundtripKind)}catch{}}
+              if(-not $script:dl){$script:dl=(Get-Date).AddMinutes(345)}
+              $script:f=New-Object System.Windows.Forms.Form
+              $script:f.FormBorderStyle='None';$script:f.StartPosition='Manual'
+              $script:f.Location=New-Object System.Drawing.Point(10,10)
+              $script:f.ClientSize=New-Object System.Drawing.Size(240,50)
+              $script:f.TopMost=$true;$script:f.ShowInTaskbar=$false
+              $script:f.BackColor=[System.Drawing.Color]::FromArgb(15,15,18);$script:f.Opacity=0.9
+              $script:l=New-Object System.Windows.Forms.Label
+              $script:l.Dock='Fill';$script:l.TextAlign='MiddleCenter'
+              $script:l.Font=New-Object System.Drawing.Font('Consolas',12,[System.Drawing.FontStyle]::Bold)
+              $script:l.ForeColor=[System.Drawing.Color]::FromArgb(0,230,140)
+              $script:l.Text="Remaining: -- min`r`n--:--:--"
+              $script:f.Controls.Add($script:l)
+              $script:dg=$false;$script:org=New-Object System.Drawing.Point(0,0)
+              $dd={param($s,$e)if($e.Button-eq[System.Windows.Forms.MouseButtons]::Left){$script:dg=$true;$script:org=$e.Location}}
+              $mv={param($s,$e)if($script:dg){$script:f.Location=New-Object System.Drawing.Point(($script:f.Location.X+$e.X-$script:org.X),($script:f.Location.Y+$e.Y-$script:org.Y))}}
+              $up={$script:dg=$false}
+              $script:l.Add_MouseDown($dd);$script:l.Add_MouseMove($mv);$script:l.Add_MouseUp($up)
+              $script:f.Add_MouseDown($dd);$script:f.Add_MouseMove($mv);$script:f.Add_MouseUp($up)
+              $script:l.Add_DoubleClick({$script:f.Location=New-Object System.Drawing.Point(10,10)})
+              $script:t=New-Object System.Windows.Forms.Timer;$script:t.Interval=1000
+              $script:t.Add_Tick({
+                $total=[math]::Floor(($script:dl-(Get-Date)).TotalSeconds)
+                if($total-le 0){$script:l.Text="Remaining: 0 min`r`n00:00:00";$script:l.ForeColor=[System.Drawing.Color]::FromArgb(255,80,80);return}
+                $mm=[math]::Ceiling(($script:dl-(Get-Date)).TotalMinutes)
+                $cl='{0:00}:{1:00}:{2:00}'-f[math]::Floor($total/3600),[math]::Floor(($total%3600)/60),($total%60)
+                $script:l.Text="Remaining: $mm min`r`n$cl"
+                if($total-le 300){$script:l.ForeColor=[System.Drawing.Color]::FromArgb(255,80,80)}
+                elseif($total-le 900){$script:l.ForeColor=[System.Drawing.Color]::FromArgb(255,176,32)}
+                else{$script:l.ForeColor=[System.Drawing.Color]::FromArgb(0,230,140)}
+                if(-not $script:f.TopMost){$script:f.TopMost=$true}
+              })
+              $script:t.Start()
+              [System.Windows.Forms.Application]::EnableVisualStyles()
+              [System.Windows.Forms.Application]::Run($script:f)
+              '@ | Set-Content -Path $timerPath -Encoding UTF8
+          }
+
+          $vbs = @"
+          Set sh = CreateObject("WScript.Shell")
+          sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ""$timerPath""", 0, False
+          "@
+          Set-Content -Path $timerLauncher -Value $vbs -Encoding ASCII
+
+          # Redundant launch: 3x Startup folders + HKLM Run + scheduled task
+          foreach ($sd in @(
+              "C:\Users\$env:RDP_USER\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup",
+              "C:\Users\Default\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup",
+              "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
+          )) {
+              if (-not (Test-Path -LiteralPath $sd)) { New-Item -ItemType Directory -Path $sd -Force | Out-Null }
+              Copy-Item -LiteralPath $timerLauncher -Destination (Join-Path $sd 'FabricTimer.vbs') -Force -ErrorAction SilentlyContinue
+          }
+          New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Force | Out-Null
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "RDPFabric-Timer" -Value ('wscript.exe "{0}"' -f $timerLauncher) -Type String -Force
+
+          $tmAction  = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$timerLauncher`""
+          $tmTrigger = New-ScheduledTaskTrigger -AtLogOn -User $taskUser
+          $tmTrigger.Delay = "PT5S"
+          $tmPrin = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Limited
+          $tmSet  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+          Register-ScheduledTask -TaskName "RDPFabric-Timer" -Action $tmAction -Trigger $tmTrigger -Principal $tmPrin -Settings $tmSet -Force | Out-Null
+
+          # HKCU visual tweaks at logon
           $hkcuTweaks = @'
           $ErrorActionPreference = 'SilentlyContinue'
           Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'MenuShowDelay' -Value '0'
@@ -1109,86 +1153,12 @@ jobs:
           $tAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$hkcuPath`""
           $tTrigger = New-ScheduledTaskTrigger -AtLogOn -User $taskUser
           $tTrigger.Delay = "PT3S"
-          Register-ScheduledTask -TaskName "RDPFabric-UserTweaks" -Action $tAction -Trigger $tTrigger -Principal $ePrin -Settings $eSet -Force | Out-Null
+          Register-ScheduledTask -TaskName "RDPFabric-UserTweaks" -Action $tAction -Trigger $tTrigger -Principal $bPrin -Settings $bSet -Force | Out-Null
 
-          # ══════════ UPDATE 2: TIMER WATCH — loaded from repo file ══════════
-          $timerPath = Join-Path $fabricRoot "FabricTimer.ps1"
-          $timerLauncher = Join-Path $fabricRoot "FabricTimer.vbs"
-
-          $timerSrc = $null
-          foreach ($cand in @(
-              "$env:GITHUB_WORKSPACE\.github\scripts\fabric-timer.ps1",
-              "$env:GITHUB_WORKSPACE\fabric-timer.ps1",
-              "$env:GITHUB_WORKSPACE\.github\workflows\fabric-timer.ps1"
-          )) {
-              if (Test-Path -LiteralPath $cand -PathType Leaf) { $timerSrc = $cand; break }
-          }
-
-          if ($timerSrc) {
-              Copy-Item -LiteralPath $timerSrc -Destination $timerPath -Force
-              Write-Host "Timer script installed from repo → $timerSrc" -ForegroundColor Green
-          } else {
-              Write-Host "fabric-timer.ps1 not found in repo — writing compact built-in fallback." -ForegroundColor Yellow
-              $fallback = @'
-              $ErrorActionPreference='SilentlyContinue'
-              Add-Type -AssemblyName System.Windows.Forms
-              Add-Type -AssemblyName System.Drawing
-              $m=New-Object System.Threading.Mutex($false,'Local\RDPFabricTimerOverlay'); if(-not $m.WaitOne(0)){return}
-              $df='C:\ProgramData\RDPFabric\deadline.txt'; $dl=$null
-              if(Test-Path $df){try{$dl=[datetime]::Parse((Get-Content $df -Raw).Trim(),[System.Globalization.CultureInfo]::InvariantCulture,[System.Globalization.DateTimeStyles]::RoundtripKind)}catch{}}
-              if(-not $dl){$dl=(Get-Date).AddMinutes(345)}
-              $f=New-Object System.Windows.Forms.Form
-              $f.FormBorderStyle='None';$f.StartPosition='Manual';$f.Location=New-Object System.Drawing.Point(10,10)
-              $f.ClientSize=New-Object System.Drawing.Size(240,50);$f.TopMost=$true;$f.ShowInTaskbar=$false
-              $f.BackColor=[System.Drawing.Color]::FromArgb(15,15,18);$f.Opacity=0.9
-              $l=New-Object System.Windows.Forms.Label;$l.Dock='Fill';$l.TextAlign='MiddleCenter'
-              $l.Font=New-Object System.Drawing.Font('Consolas',12,[System.Drawing.FontStyle]::Bold)
-              $l.ForeColor=[System.Drawing.Color]::FromArgb(0,230,140);$l.Text="Remaining: -- min`r`n--:--:--"
-              $f.Controls.Add($l)
-              $script:dg=$false;$script:org=New-Object System.Drawing.Point(0,0)
-              $d={param($s,$e)if($e.Button-eq[System.Windows.Forms.MouseButtons]::Left){$script:dg=$true;$script:org=$e.Location}}
-              $mv={param($s,$e)if($script:dg){$f.Location=New-Object System.Drawing.Point(($f.Location.X+$e.X-$script:org.X),($f.Location.Y+$e.Y-$script:org.Y))}}
-              $up={$script:dg=$false}
-              $l.Add_MouseDown($d);$l.Add_MouseMove($mv);$l.Add_MouseUp($up)
-              $f.Add_MouseDown($d);$f.Add_MouseMove($mv);$f.Add_MouseUp($up)
-              $l.Add_DoubleClick({$f.Location=New-Object System.Drawing.Point(10,10)})
-              $t=New-Object System.Windows.Forms.Timer;$t.Interval=1000
-              $t.Add_Tick({
-                $total=[math]::Floor(($dl-(Get-Date)).TotalSeconds)
-                if($total-le 0){$l.Text="Remaining: 0 min`r`n00:00:00";$l.ForeColor=[System.Drawing.Color]::FromArgb(255,80,80);return}
-                $mm=[math]::Ceiling(($dl-(Get-Date)).TotalMinutes)
-                $cl='{0:00}:{1:00}:{2:00}'-f[math]::Floor($total/3600),[math]::Floor(($total%3600)/60),($total%60)
-                $l.Text="Remaining: $mm min`r`n$cl"
-                if($total-le 300){$l.ForeColor=[System.Drawing.Color]::FromArgb(255,80,80)}
-                elseif($total-le 900){$l.ForeColor=[System.Drawing.Color]::FromArgb(255,176,32)}
-                else{$l.ForeColor=[System.Drawing.Color]::FromArgb(0,230,140)}
-                if(-not $f.TopMost){$f.TopMost=$true}
-              })
-              $t.Start()
-              [System.Windows.Forms.Application]::EnableVisualStyles()
-              [System.Windows.Forms.Application]::Run($f)
-              '@
-              Set-Content -Path $timerPath -Value $fallback -Encoding UTF8
-          }
-
-          $vbs = @"
-          Set sh = CreateObject("WScript.Shell")
-          sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""$timerPath""", 0, False
-          "@
-          Set-Content -Path $timerLauncher -Value $vbs -Encoding ASCII
-          $timerAction = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$timerLauncher`""
-          $timerTrigger = New-ScheduledTaskTrigger -AtLogOn -User $taskUser
-          $timerTrigger.Delay = "PT5S"
-          $timerPrin = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Limited
-          $timerSet = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-          Register-ScheduledTask -TaskName "RDPFabric-Timer" -Action $timerAction -Trigger $timerTrigger -Principal $timerPrin -Settings $timerSet -Force | Out-Null
-          $startupDir = "C:\Users\$env:RDP_USER\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
-          if (Test-Path $startupDir) { Copy-Item -Path $timerLauncher -Destination (Join-Path $startupDir "FabricTimer.vbs") -Force -ErrorAction SilentlyContinue }
-          Write-Host "Timer overlay armed (Remaining: N min + HH:MM:SS)." -ForegroundColor Green
-
+          Write-Host "Timer armed (3x Startup + Run key + task + Phase 8 watchdog)." -ForegroundColor Green
           Write-Host "Workstation armed. Drop: $drop | Dumps: $dumps" -ForegroundColor Green
 
-      # ── 8. HOLD + GOVERNOR + MOTW WATCH + CYCLE ─────────────────────────
+      # ── 8. HOLD + GOVERNOR + WATCHDOG + CYCLE ──────────────────────────
       - name: "Phase 8: Session Hold, Self-Healing Governor & Cycle Handoff"
         env:
           GH_TOKEN: ${{ secrets.GH_PAT != '' && secrets.GH_PAT || github.token }}
@@ -1228,6 +1198,7 @@ jobs:
               $tick++
               $remaining = [math]::Max(0, [math]::Round($minutes - (New-TimeSpan -Start $start -End (Get-Date)).TotalMinutes, 1))
 
+              # Tailscale watchdog
               $tsOk = $false
               if (Test-Path -LiteralPath $tsPath) {
                   $backend = $null
@@ -1239,6 +1210,7 @@ jobs:
                   }
               }
 
+              # RDP watchdog
               $rdpOk = [bool](Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue)
               if (-not $rdpOk) {
                   Write-Host "RDP listener down — re-arming..." -ForegroundColor Yellow
@@ -1248,18 +1220,41 @@ jobs:
                   New-NetFirewallRule -DisplayName "RDP-UDP-In" -Direction Inbound -Protocol UDP -LocalPort 3389 -Action Allow -ErrorAction SilentlyContinue | Out-Null
               }
 
+              # Memory governor
               $freeMb = [int]((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1KB)
               if ($freeMb -lt 768 -and (Test-Path -LiteralPath $govPath)) {
                   try { $freeMb = [int](& $govPath -PressureMb 768) } catch {}
                   Write-Host "Governor trimmed standby/working-sets. Free now ${freeMb} MB." -ForegroundColor Yellow
               }
 
+              # MOTW sweep: newly dropped files become runnable within 60s
               foreach ($dir in @($drop, "C:\Users\$env:RDP_USER\Desktop", "C:\Users\$env:RDP_USER\Downloads")) {
                   Get-ChildItem -LiteralPath $dir -Recurse -Depth 1 -File -ErrorAction SilentlyContinue |
                       Where-Object { $_.Extension -in @('.exe','.msi','.msix','.bat','.cmd','.ps1','.vbs','.zip','.7z','.rar','.appx') } |
                       ForEach-Object { Unblock-File -LiteralPath $_.FullName -ErrorAction SilentlyContinue }
               }
 
+              # Timer + Browser relaunch (path #6/7) when FabricAdmin is logged in but overlays are gone
+              $uSessions = ''
+              try { $uSessions = quser 2>$null | Out-String } catch {}
+              if ($uSessions -match [regex]::Escape($env:RDP_USER)) {
+                  $tAlive = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+                      Where-Object { $_.CommandLine -like '*FabricTimer.ps1*' }
+                  if (-not $tAlive) {
+                      Write-Host "Timer overlay missing in active session — relaunching..." -ForegroundColor Yellow
+                      try { Start-ScheduledTask -TaskName 'RDPFabric-Timer' -ErrorAction Stop } catch { & schtasks /run /tn 'RDPFabric-Timer' 2>$null | Out-Null }
+                  }
+                  if (($tick % 5) -eq 0) {
+                      $bAlive = Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue |
+                          Where-Object { $_.CommandLine -like '*fabric-x-xi*' -or $_.CommandLine -like "*$env:STARTUP_URL*" }
+                      if (-not $bAlive) {
+                          Write-Host "Browser window missing — relaunching..." -ForegroundColor Yellow
+                          try { Start-ScheduledTask -TaskName 'RDPFabric-BrowserOpen' -ErrorAction Stop } catch { & schtasks /run /tn 'RDPFabric-BrowserOpen' 2>$null | Out-Null }
+                      }
+                  }
+              }
+
+              # Re-assert Defender/Update off every 5 min
               if (($tick % 5) -eq 0) {
                   try { Set-MpPreference -DisableRealtimeMonitoring $true -Force -ErrorAction SilentlyContinue } catch {}
                   foreach ($svc in @('WSearch','SysMain','DoSvc','wuauserv','bits','WerSvc','PcaSvc')) {
@@ -1312,10 +1307,10 @@ jobs:
           $ErrorActionPreference = 'SilentlyContinue'
           $tsPath = "C:\Program Files\Tailscale\tailscale.exe"
           if (Test-Path -LiteralPath $tsPath) { Write-Host "Logging out of Tailnet..."; & $tsPath logout 2>$null | Out-Null }
-          foreach ($t in 'RDPFabric-Timer','RDPFabric-EdgeOpen','RDPFabric-UserTweaks','RDPFabric-UserNetTweaks') {
+          foreach ($t in 'RDPFabric-Timer','RDPFabric-BrowserOpen','RDPFabric-UserTweaks','RDPFabric-UserNetTweaks') {
               Unregister-ScheduledTask -TaskName $t -Confirm:$false -ErrorAction SilentlyContinue
           }
-          try { Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "RDPFabric-ChromeApp" -Force -ErrorAction SilentlyContinue } catch {}
+          Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "RDPFabric-Timer" -Force -ErrorAction SilentlyContinue
           Write-Host "Teardown complete."
 
       # ── 10. FAILURE ALERT ───────────────────────────────────────────────
