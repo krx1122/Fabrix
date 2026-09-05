@@ -1,6 +1,10 @@
 # ═══════════════════════════════════════════════════════════════════════════
-#  RDP FABRIC v5.1 FINAL — application-focused, Edge auto-open, minutes timer
+#  RDP FABRIC v5.2 FINAL — application-focused, Edge auto-open, minutes timer
 #  Pure Tailscale · Self-healing hold loop · Runtime bootstrap · Crash dumps
+#
+#  FILES:
+#     .github/workflows/rdp-fabric.yml    ← this file
+#     .github/scripts/fabric-timer.ps1    ← countdown overlay (checked out + copied)
 # ═══════════════════════════════════════════════════════════════════════════
 
 name: "RDP Fabric (Pure Tailscale)"
@@ -112,12 +116,16 @@ jobs:
       STARTUP_URL: ${{ inputs.startup_url }}
 
     steps:
+      # ── CHECKOUT (timer + helper scripts) ──────────────────────────────
+      - name: "Checkout Repo (timer script)"
+        uses: actions/checkout@v4
+
       # ── 0. INVENTORY + STATE + BACKGROUND TS DOWNLOAD ───────────────────
       - name: "Phase 0: Inventory, State & Adaptive Profile"
         run: |
           $ErrorActionPreference = 'Continue'
           $ProgressPreference = 'SilentlyContinue'
-          Write-Host "FABRIC v5.1 — application-focused bring-up" -ForegroundColor Cyan
+          Write-Host "FABRIC v5.2 — application-focused bring-up" -ForegroundColor Cyan
 
           $runtime = [int]"${{ inputs.runtime_minutes }}"
           if ("${{ inputs.quick_test }}" -eq "true") { $runtime = 5 }
@@ -166,14 +174,14 @@ jobs:
           $ramdiskOk   = ($env:ENABLE_RAMDISK -eq 'true' -and $ramGB -ge 28 -and $freeRamGB -ge 12)
           $compressMem = ($profile -eq 'memory' -or $ramGB -lt 20)
           $pinKernel   = ($ramGB -ge 20 -and $profile -ne 'memory')
-          if ($ramGB -lt 12)            { $pagefileMult = 2.5 }
-          elseif ($ramGB -lt 24)        { $pagefileMult = 2.0 }
+          if ($ramGB -lt 12)              { $pagefileMult = 2.5 }
+          elseif ($ramGB -lt 24)          { $pagefileMult = 2.0 }
           elseif ($profile -eq 'compute') { $pagefileMult = 1.75 }
           elseif ($profile -eq 'memory')  { $pagefileMult = 2.0 }
-          else                          { $pagefileMult = 1.25 }
+          else                            { $pagefileMult = 1.25 }
 
           $state = [ordered]@{
-              version='5.1'; minutes=$runtime; deadline=$deadlineStr
+              version='5.2'; minutes=$runtime; deadline=$deadlineStr
               data_root=$dataRoot; fab_root=$env:FABRIC_ROOT; user=$env:RDP_USER
               profile=$profile; ram_gb=$ramGB; free_ram_gb=$freeRamGB
               cpu=$cpuCount; cpu_cores=$cpuCores; cpu_name=$cpuName
@@ -613,7 +621,7 @@ jobs:
           Write-Host "==========================================" -ForegroundColor Cyan
           $tgMarker = Join-Path $env:FABRIC_ROOT 'telegram.sent'
           if ($env:TG_TOKEN -and $env:TG_CHAT -and -not (Test-Path -LiteralPath $tgMarker)) {
-              $msg = "⚡ <b>Fabric Node Online v5.1</b>`n`n🖥 <b>Host:</b> <code>$hostname</code>`n🌐 <b>IP:</b> <code>$ip</code>`n🔗 <b>Path:</b> <code>$linkNow</code>`n👤 <b>User:</b> <code>$env:RDP_USER</code>`n🧠 <b>Profile:</b> <code>$env:FABRIC_PROFILE</code>`n⚙️ <b>HW:</b> <code>$env:FABRIC_CPU CPU / $env:FABRIC_RAM_GB GB</code>`n⏳ <b>Duration:</b> <code>$env:SESSION_MINUTES</code> min`n📁 <b>Drop:</b> <code>$dataRootNow\Drop</code>"
+              $msg = "⚡ <b>Fabric Node Online v5.2</b>`n`n🖥 <b>Host:</b> <code>$hostname</code>`n🌐 <b>IP:</b> <code>$ip</code>`n🔗 <b>Path:</b> <code>$linkNow</code>`n👤 <b>User:</b> <code>$env:RDP_USER</code>`n🧠 <b>Profile:</b> <code>$env:FABRIC_PROFILE</code>`n⚙️ <b>HW:</b> <code>$env:FABRIC_CPU CPU / $env:FABRIC_RAM_GB GB</code>`n⏳ <b>Duration:</b> <code>$env:SESSION_MINUTES</code> min`n📁 <b>Drop:</b> <code>$dataRootNow\Drop</code>"
               try {
                   Invoke-RestMethod -Uri "https://api.telegram.org/bot$($env:TG_TOKEN)/sendMessage" -Method Post -Body @{chat_id=$env:TG_CHAT; text=$msg; parse_mode="HTML"} -TimeoutSec 15 | Out-Null
                   Set-Content -Path $tgMarker -Value (Get-Date -Format o) -Encoding ASCII
@@ -701,7 +709,7 @@ jobs:
           } catch {}
 
           $status = [ordered]@{
-              version='5.1'; host=$hostname; ip=$ip; path=$(if ($direct) { 'direct' } else { 'DERP relay' })
+              version='5.2'; host=$hostname; ip=$ip; path=$(if ($direct) { 'direct' } else { 'DERP relay' })
               user=$env:RDP_USER; minutes=if ($env:SESSION_MINUTES) { [int]$env:SESSION_MINUTES } else { $null }
               deadline=$env:SESSION_DEADLINE; profile=$env:FABRIC_PROFILE; ram_gb=$env:FABRIC_RAM_GB
               cpu=$env:FABRIC_CPU; rdp_comp=$wantComp; startup_url=$env:STARTUP_URL
@@ -859,7 +867,7 @@ jobs:
           $probe | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $env:FABRIC_ROOT 'fabric-https.json') -Encoding UTF8
           Write-Host "High-concurrency HTTPS stack applied." -ForegroundColor Green
 
-      # ── 6. RUNTIME BOOTSTRAP (fixes most "opens then closes" crashes) ───
+      # ── 6. RUNTIME BOOTSTRAP ────────────────────────────────────────────
       - name: "Phase 6: VC++ / DirectX / .NET / WebView2 / 7-Zip"
         continue-on-error: true
         run: |
@@ -946,7 +954,6 @@ jobs:
           $dumps  = Join-Path $dataRoot "CrashDumps"
           foreach ($d in @($drop,$tools,$dumps)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
 
-          # ---- UAC fully off: unsigned/legacy apps run without consent prompts ----
           $lu = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
           Set-ItemProperty -Path $lu -Name "EnableLUA" -Value 0 -Type DWord -Force
           Set-ItemProperty -Path $lu -Name "ConsentPromptBehaviorAdmin" -Value 0 -Type DWord -Force
@@ -960,7 +967,6 @@ jobs:
           Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\PowerShell\1\ShellIds\Microsoft.PowerShell" -Name "ExecutionPolicy" -Value "Bypass" -Type String -Force
           Set-ExecutionPolicy -Scope LocalMachine -ExecutionPolicy Bypass -Force -ErrorAction SilentlyContinue
 
-          # ---- WER LocalDumps: capture WHY an app dies (mini dumps, small) ----
           New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps" -Force | Out-Null
           Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps" -Name "DumpFolder" -Value $dumps -Type ExpandString -Force
           Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps" -Name "DumpCount" -Value 20 -Type DWord -Force
@@ -993,7 +999,7 @@ jobs:
               }
           }
 
-          # ---- Governor helper (trims standby/working sets, never kills user apps) ----
+          # ---- Governor helper ----
           $gov = @'
           param([int]$PressureMb = 768)
           $ErrorActionPreference = 'SilentlyContinue'
@@ -1025,11 +1031,9 @@ jobs:
           '@
           Set-Content -Path (Join-Path $fabricRoot "Governor.ps1") -Value $gov -Encoding UTF8
 
-          # ══════════ UPDATE 1: AUTO-OPEN SITE IN DEFAULT BROWSER (EDGE) ══════════
+          # ══════════ UPDATE 1: AUTO-OPEN SITE IN EDGE (default browser) ══════════
           $startupUrl = if ($env:STARTUP_URL) { $env:STARTUP_URL } else { "https://fabric-x-xi.vercel.app" }
-          try { Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "RDPFabric-ChromeApp" -Force -ErrorAction SilentlyContinue } catch {}
 
-          # Edge policy: homepage + bookmark on the start-page button, no forced second tab.
           $edgePol = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
           New-Item -Path $edgePol -Force | Out-Null
           New-ItemProperty -Path $edgePol -Name "RestoreOnStartup" -PropertyType DWord -Value 5 -Force | Out-Null
@@ -1041,13 +1045,11 @@ jobs:
           $bookmarkJson = @(@{ toplevel_name = "RDP Fabric" }, @{ name = "Fabric App"; url = $startupUrl }) | ConvertTo-Json -Depth 10 -Compress
           New-ItemProperty -Path $edgePol -Name "ManagedBookmarks" -PropertyType String -Value $bookmarkJson -Force | Out-Null
 
-          # Desktop .url shortcut → opens in the default browser (Edge).
           $urlContent = "[InternetShortcut]`r`nURL=$startupUrl`r`n"
           foreach ($desk in @("C:\Users\Public\Desktop", "C:\Users\$env:RDP_USER\Desktop")) {
               if (Test-Path $desk) { Set-Content -Path (Join-Path $desk "Fabric App.url") -Value $urlContent -Encoding ASCII -Force }
           }
 
-          # Single-instance Edge launcher (mutex + lock + running-window check).
           $edgeOpenPath = Join-Path $fabricRoot "EdgeOpen.ps1"
           $edgeScript = @'
           $ErrorActionPreference = 'Continue'
@@ -1109,89 +1111,66 @@ jobs:
           $tTrigger.Delay = "PT3S"
           Register-ScheduledTask -TaskName "RDPFabric-UserTweaks" -Action $tAction -Trigger $tTrigger -Principal $ePrin -Settings $eSet -Force | Out-Null
 
-          # ══════════ UPDATE 2: TIMER WATCH — REMAINING MINUTES + HH:MM:SS ══════════
+          # ══════════ UPDATE 2: TIMER WATCH — loaded from repo file ══════════
           $timerPath = Join-Path $fabricRoot "FabricTimer.ps1"
           $timerLauncher = Join-Path $fabricRoot "FabricTimer.vbs"
-          $timerScript = @'
-          $ErrorActionPreference = 'SilentlyContinue'
-          Add-Type -AssemblyName System.Windows.Forms
-          Add-Type -AssemblyName System.Drawing
-          $script:mutex = New-Object System.Threading.Mutex($false, 'Local\RDPFabricTimerOverlay')
-          if (-not $script:mutex.WaitOne(0)) { return }
-          $script:deadlineFile = 'C:\ProgramData\RDPFabric\deadline.txt'
-          $script:deadline = $null
-          if (Test-Path $script:deadlineFile) {
-              $raw = (Get-Content -Path $script:deadlineFile -Raw)
-              if ($raw) {
-                  try {
-                      $script:deadline = [datetime]::Parse($raw.Trim(),
-                          [System.Globalization.CultureInfo]::InvariantCulture,
-                          [System.Globalization.DateTimeStyles]::RoundtripKind)
-                  } catch { $script:deadline = $null }
-              }
+
+          $timerSrc = $null
+          foreach ($cand in @(
+              "$env:GITHUB_WORKSPACE\.github\scripts\fabric-timer.ps1",
+              "$env:GITHUB_WORKSPACE\fabric-timer.ps1",
+              "$env:GITHUB_WORKSPACE\.github\workflows\fabric-timer.ps1"
+          )) {
+              if (Test-Path -LiteralPath $cand -PathType Leaf) { $timerSrc = $cand; break }
           }
-          if (-not $script:deadline) { $script:deadline = (Get-Date).AddMinutes(345) }
-          $form = New-Object System.Windows.Forms.Form
-          $form.Text = 'Fabric Timer'
-          $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
-          $form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
-          $form.Location = New-Object System.Drawing.Point(10, 10)
-          $form.ClientSize = New-Object System.Drawing.Size(240, 50)
-          $form.TopMost = $true
-          $form.ShowInTaskbar = $false
-          $form.BackColor = [System.Drawing.Color]::FromArgb(15, 15, 18)
-          $form.Opacity = 0.90
-          $label = New-Object System.Windows.Forms.Label
-          $label.Dock = [System.Windows.Forms.DockStyle]::Fill
-          $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
-          $label.Font = New-Object System.Drawing.Font('Consolas', 12, [System.Drawing.FontStyle]::Bold)
-          $label.ForeColor = [System.Drawing.Color]::FromArgb(0, 230, 140)
-          $label.Text = "Remaining: -- min`r`n--:--:--"
-          $form.Controls.Add($label)
-          $form.Add_Paint({
-              param($s, $e)
-              $pen = New-Object System.Drawing.Pen -ArgumentList ([System.Drawing.Color]::FromArgb(70, 70, 78)), 1
-              $e.Graphics.DrawRectangle($pen, 0, 0, $s.ClientSize.Width - 1, $s.ClientSize.Height - 1)
-              $pen.Dispose()
-          })
-          $script:dragging = $false
-          $script:dragOrigin = New-Object System.Drawing.Point(0, 0)
-          $onDown = { param($s, $e) if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { $script:dragging = $true; $script:dragOrigin = $e.Location } }
-          $onMove = { param($s, $e) if ($script:dragging) { $form.Location = New-Object System.Drawing.Point(($form.Location.X + $e.X - $script:dragOrigin.X), ($form.Location.Y + $e.Y - $script:dragOrigin.Y)) } }
-          $onUp = { $script:dragging = $false }
-          $label.Add_MouseDown($onDown); $label.Add_MouseMove($onMove); $label.Add_MouseUp($onUp)
-          $form.Add_MouseDown($onDown);  $form.Add_MouseMove($onMove);  $form.Add_MouseUp($onUp)
-          $label.Add_DoubleClick({ $form.Location = New-Object System.Drawing.Point(10, 10) })
-          $timer = New-Object System.Windows.Forms.Timer
-          $timer.Interval = 1000
-          $timer.Add_Tick({
-              $remaining = $script:deadline - (Get-Date)
-              $total = [math]::Floor($remaining.TotalSeconds)
-              if ($total -le 0) {
-                  $label.Text = "Remaining: 0 min`r`n00:00:00"
-                  $label.ForeColor = [System.Drawing.Color]::FromArgb(255, 80, 80)
-                  return
-              }
-              $min = [math]::Ceiling($remaining.TotalMinutes)
-              $h = [math]::Floor($total / 3600)
-              $m = [math]::Floor(($total % 3600) / 60)
-              $s = $total % 60
-              $clock = ('{0:00}:{1:00}:{2:00}' -f $h, $m, $s)
-              $label.Text = "Remaining: ${min} min`r`n${clock}"
-              if ($total -le 300)       { $label.ForeColor = [System.Drawing.Color]::FromArgb(255, 80, 80) }
-              elseif ($total -le 900)   { $label.ForeColor = [System.Drawing.Color]::FromArgb(255, 176, 32) }
-              else                       { $label.ForeColor = [System.Drawing.Color]::FromArgb(0, 230, 140) }
-              if (-not $form.TopMost) { $form.TopMost = $true }
-          })
-          $timer.Start()
-          $keepTop = New-Object System.Windows.Forms.Timer
-          $keepTop.Interval = 30000
-          $keepTop.Add_Tick({ $form.TopMost = $false; $form.TopMost = $true })
-          $keepTop.Start()
-          [System.Windows.Forms.Application]::EnableVisualStyles()
-          [System.Windows.Forms.Application]::Run($form)
-          '@
-          Set-Content -Path $timerPath -Value $timerScript -Encoding UTF8
+
+          if ($timerSrc) {
+              Copy-Item -LiteralPath $timerSrc -Destination $timerPath -Force
+              Write-Host "Timer script installed from repo → $timerSrc" -ForegroundColor Green
+          } else {
+              Write-Host "fabric-timer.ps1 not found in repo — writing compact built-in fallback." -ForegroundColor Yellow
+              $fallback = @'
+              $ErrorActionPreference='SilentlyContinue'
+              Add-Type -AssemblyName System.Windows.Forms
+              Add-Type -AssemblyName System.Drawing
+              $m=New-Object System.Threading.Mutex($false,'Local\RDPFabricTimerOverlay'); if(-not $m.WaitOne(0)){return}
+              $df='C:\ProgramData\RDPFabric\deadline.txt'; $dl=$null
+              if(Test-Path $df){try{$dl=[datetime]::Parse((Get-Content $df -Raw).Trim(),[System.Globalization.CultureInfo]::InvariantCulture,[System.Globalization.DateTimeStyles]::RoundtripKind)}catch{}}
+              if(-not $dl){$dl=(Get-Date).AddMinutes(345)}
+              $f=New-Object System.Windows.Forms.Form
+              $f.FormBorderStyle='None';$f.StartPosition='Manual';$f.Location=New-Object System.Drawing.Point(10,10)
+              $f.ClientSize=New-Object System.Drawing.Size(240,50);$f.TopMost=$true;$f.ShowInTaskbar=$false
+              $f.BackColor=[System.Drawing.Color]::FromArgb(15,15,18);$f.Opacity=0.9
+              $l=New-Object System.Windows.Forms.Label;$l.Dock='Fill';$l.TextAlign='MiddleCenter'
+              $l.Font=New-Object System.Drawing.Font('Consolas',12,[System.Drawing.FontStyle]::Bold)
+              $l.ForeColor=[System.Drawing.Color]::FromArgb(0,230,140);$l.Text="Remaining: -- min`r`n--:--:--"
+              $f.Controls.Add($l)
+              $script:dg=$false;$script:org=New-Object System.Drawing.Point(0,0)
+              $d={param($s,$e)if($e.Button-eq[System.Windows.Forms.MouseButtons]::Left){$script:dg=$true;$script:org=$e.Location}}
+              $mv={param($s,$e)if($script:dg){$f.Location=New-Object System.Drawing.Point(($f.Location.X+$e.X-$script:org.X),($f.Location.Y+$e.Y-$script:org.Y))}}
+              $up={$script:dg=$false}
+              $l.Add_MouseDown($d);$l.Add_MouseMove($mv);$l.Add_MouseUp($up)
+              $f.Add_MouseDown($d);$f.Add_MouseMove($mv);$f.Add_MouseUp($up)
+              $l.Add_DoubleClick({$f.Location=New-Object System.Drawing.Point(10,10)})
+              $t=New-Object System.Windows.Forms.Timer;$t.Interval=1000
+              $t.Add_Tick({
+                $total=[math]::Floor(($dl-(Get-Date)).TotalSeconds)
+                if($total-le 0){$l.Text="Remaining: 0 min`r`n00:00:00";$l.ForeColor=[System.Drawing.Color]::FromArgb(255,80,80);return}
+                $mm=[math]::Ceiling(($dl-(Get-Date)).TotalMinutes)
+                $cl='{0:00}:{1:00}:{2:00}'-f[math]::Floor($total/3600),[math]::Floor(($total%3600)/60),($total%60)
+                $l.Text="Remaining: $mm min`r`n$cl"
+                if($total-le 300){$l.ForeColor=[System.Drawing.Color]::FromArgb(255,80,80)}
+                elseif($total-le 900){$l.ForeColor=[System.Drawing.Color]::FromArgb(255,176,32)}
+                else{$l.ForeColor=[System.Drawing.Color]::FromArgb(0,230,140)}
+                if(-not $f.TopMost){$f.TopMost=$true}
+              })
+              $t.Start()
+              [System.Windows.Forms.Application]::EnableVisualStyles()
+              [System.Windows.Forms.Application]::Run($f)
+              '@
+              Set-Content -Path $timerPath -Value $fallback -Encoding UTF8
+          }
+
           $vbs = @"
           Set sh = CreateObject("WScript.Shell")
           sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""$timerPath""", 0, False
