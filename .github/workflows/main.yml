@@ -1,6 +1,11 @@
 # ═══════════════════════════════════════════════════════════════════════════
-#  RDP FABRIC PRO v7.0 — "Menlít" (Tailscale · App-Tuned · Self-Healing)
+#  RDP FABRIC PRO v7.1 — "Menlít" (Tailscale · App-Tuned · Self-Healing)
 #  Single-file workflow — NO external scripts, NO checkout required.
+#
+#  v7.1 adds (must-fix on hosted SKU):
+#     • Junction Desktop/Downloads/Documents → D:\RDPFabric\Data\User (stops C: fill)
+#     • Launch-InSession.ps1 — start GUI apps in the RDP session, not Session 0
+#     • Server-Media-Foundation (Electron/video on Windows Server)
 #
 #  What's inside (all embedded):
 #     • Tailscale mesh (auth-key only, NO API key) + split TCP stack
@@ -23,7 +28,7 @@
 #     GH_PAT (workflow scope)                     ← required only for cycles>0
 # ═══════════════════════════════════════════════════════════════════════════
 
-name: "RDP Fabric Pro v7.0 — Tailscale Menlít (App-Tuned)"
+name: "RDP Fabric Pro v7.1 — Tailscale Menlít (App-Tuned)"
 
 on:
   workflow_dispatch:
@@ -138,7 +143,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Continue'
           $ProgressPreference = 'SilentlyContinue'
-          Write-Host "RDP Fabric Pro v7.0 (Menlít) — application-focused bring-up" -ForegroundColor Cyan
+          Write-Host "RDP Fabric Pro v7.1 (Menlít) — application-focused bring-up" -ForegroundColor Cyan
 
           $runtime = [int]"${{ inputs.runtime_minutes }}"
           if ("${{ inputs.quick_test }}" -eq "true") { $runtime = 5 }
@@ -173,7 +178,7 @@ jobs:
           $dataRoot = $null
           if ($best) { $dataRoot = "$($best.DriveLetter):\RDPFabric\Data" }
           if (-not $dataRoot) { $dataRoot = Join-Path $env:FABRIC_ROOT 'Data' }
-          foreach ($d in @('Temp','Drop','Tools','Tools\Kits','CrashDumps','nuget','npm-cache','pip-cache','cargo','gradle','dotnet')) {
+          foreach ($d in @('Temp','Drop','Tools','Tools\Kits','CrashDumps','nuget','npm-cache','pip-cache','cargo','gradle','dotnet','User\Desktop','User\Downloads','User\Documents')) {
               New-Item -ItemType Directory -Path (Join-Path $dataRoot $d) -Force | Out-Null
           }
 
@@ -194,7 +199,7 @@ jobs:
           else                            { $pagefileMult = 1.25 }
 
           $state = [ordered]@{
-              version='7.0'; minutes=$runtime; deadline=$deadlineStr
+              version='7.1'; minutes=$runtime; deadline=$deadlineStr
               data_root=$dataRoot; fab_root=$env:FABRIC_ROOT; user=$env:RDP_USER
               profile=$profile; ram_gb=$ramGB; free_ram_gb=$freeRamGB
               cpu=$cpuCount; cpu_cores=$cpuCores; cpu_name=$cpuName
@@ -709,7 +714,7 @@ jobs:
           } catch {}
 
           $status = [ordered]@{
-              version='7.0'; host=$hostname; ip=$ip; path=$(if ($direct) { 'direct' } else { 'DERP relay' })
+              version='7.1'; host=$hostname; ip=$ip; path=$(if ($direct) { 'direct' } else { 'DERP relay' })
               user=$env:RDP_USER; minutes=if ($env:SESSION_MINUTES) { [int]$env:SESSION_MINUTES } else { $null }
               deadline=$env:SESSION_DEADLINE; profile=$env:FABRIC_PROFILE; ram_gb=$env:FABRIC_RAM_GB
               cpu=$env:FABRIC_CPU; rdp_comp=$wantComp; startup_url=$env:STARTUP_URL
@@ -918,6 +923,7 @@ jobs:
 
           Install-Winget 'Microsoft.EdgeWebView2Runtime'
           Install-Winget '7zip.7zip'
+          try { Install-WindowsFeature Server-Media-Foundation -ErrorAction SilentlyContinue | Out-Null } catch {}
 
           "bootstrap done $(Get-Date -Format o)" | Out-File $log -Append
           Write-Host "Runtime bootstrap complete. Log: $log" -ForegroundColor Green
@@ -966,6 +972,49 @@ jobs:
               icacls $p /grant "${env:RDP_USER}:(OI)(CI)F" /T /C /Q | Out-Null
               icacls $p /grant "Everyone:(OI)(CI)F" /T /C /Q | Out-Null
           }
+
+          # Junction user folders onto D: so C: stops eating Desktop/Downloads.
+          $userHome = "C:\Users\$env:RDP_USER"
+          $ud = Join-Path $dataRoot 'User'
+          foreach ($n in @('Desktop','Downloads','Documents')) {
+              $src = Join-Path $userHome $n
+              $dst = Join-Path $ud $n
+              New-Item -ItemType Directory -Path $dst -Force | Out-Null
+              try {
+                  $item = Get-Item -LiteralPath $src -Force -ErrorAction SilentlyContinue
+                  $isLink = $item -and ($item.Attributes.ToString() -match 'ReparsePoint')
+                  if ($item -and -not $isLink) {
+                      Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force -ErrorAction SilentlyContinue
+                      cmd /c "rmdir /s /q `"$src`"" | Out-Null
+                      if (Test-Path -LiteralPath $src) { Remove-Item -LiteralPath $src -Recurse -Force -ErrorAction SilentlyContinue }
+                  }
+                  if (-not (Test-Path -LiteralPath $src)) { cmd /c "mklink /J `"$src`" `"$dst`"" | Out-Null }
+              } catch {}
+          }
+
+          $launch = Join-Path $fabricRoot 'Launch-InSession.ps1'
+          @'
+          param([Parameter(Mandatory=$true)][string]$Exe, [string]$Arguments = '')
+          $ErrorActionPreference = 'Continue'
+          if (-not (Test-Path -LiteralPath $Exe)) { Write-Error "Missing $Exe"; exit 1 }
+          Unblock-File -LiteralPath $Exe -ErrorAction SilentlyContinue
+          $wd = Split-Path $Exe
+          $task = 'PA-Launch-' + [guid]::NewGuid().ToString('N').Substring(0,8)
+          $tr = "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command Start-Process -FilePath '" + $Exe.Replace("'","''") + "' -WorkingDirectory '" + $wd.Replace("'","''") + "' -ArgumentList '" + $Arguments.Replace("'","''") + "'"
+          schtasks /Create /TN $task /TR "$tr" /SC ONCE /ST 00:00 /RL LIMITED /F /IT /RU "$env:RDP_USER" | Out-Null
+          schtasks /Run /TN $task | Out-Null
+          Write-Host "Launched in RDP session via $task"
+          '@ | Set-Content -Path $launch -Encoding UTF8
+          $wsh2 = New-Object -ComObject WScript.Shell
+          foreach ($desk in @("C:\Users\$env:RDP_USER\Desktop", "C:\Users\Public\Desktop")) {
+              if (Test-Path $desk) {
+                  $sc3 = $wsh2.CreateShortcut((Join-Path $desk "Launch In Session.lnk"))
+                  $sc3.TargetPath = "powershell.exe"
+                  $sc3.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$launch`""
+                  $sc3.Save()
+              }
+          }
+
           foreach ($dir in @($drop, "C:\Users\$env:RDP_USER\Desktop", "C:\Users\$env:RDP_USER\Downloads")) {
               Get-ChildItem -LiteralPath $dir -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { Unblock-File -LiteralPath $_.FullName -ErrorAction SilentlyContinue }
           }
@@ -1354,6 +1403,6 @@ jobs:
         if: failure()
         run: |
           if ($env:TG_TOKEN -and $env:TG_CHAT) {
-              $msg = "❌ <b>RDP Fabric Pro v7.0 FAILED</b>`n🌐 <b>IP:</b> <code>$env:TS_IP</code>`n🖥 <b>Host:</b> <code>$env:TS_HOSTNAME</code>`n👤 <b>User:</b> <code>$env:RDP_USER</code>`n🧠 <b>Profile:</b> <code>$env:FABRIC_PROFILE</code>"
+              $msg = "❌ <b>RDP Fabric Pro v7.1 FAILED</b>`n🌐 <b>IP:</b> <code>$env:TS_IP</code>`n🖥 <b>Host:</b> <code>$env:TS_HOSTNAME</code>`n👤 <b>User:</b> <code>$env:RDP_USER</code>`n🧠 <b>Profile:</b> <code>$env:FABRIC_PROFILE</code>"
               try { Invoke-RestMethod -Uri "https://api.telegram.org/bot$($env:TG_TOKEN)/sendMessage" -Method Post -Body @{chat_id=$env:TG_CHAT; text=$msg; parse_mode="HTML"} -ErrorAction SilentlyContinue | Out-Null } catch {}
           }
