@@ -1084,9 +1084,9 @@ jobs:
           $script:form.Location = New-Object System.Drawing.Point(10, 10)
           $script:form.ClientSize = New-Object System.Drawing.Size(240, 50)
           $script:form.TopMost = $true
-          $script:form.ShowInTaskbar = $false
+          $script:form.ShowInTaskbar = $true
           $script:form.BackColor = [System.Drawing.Color]::FromArgb(15, 15, 18)
-          $script:form.Opacity = 0.90
+          $script:form.Opacity = 1.0
           $script:label = New-Object System.Windows.Forms.Label
           $script:label.Dock = [System.Windows.Forms.DockStyle]::Fill
           $script:label.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
@@ -1132,6 +1132,8 @@ jobs:
           $script:keepTop.Start()
           Write-Log "showing overlay"
           [System.Windows.Forms.Application]::EnableVisualStyles()
+          $script:form.Show()
+          $script:form.Activate()
           [System.Windows.Forms.Application]::Run($script:form)
           Write-Log "overlay closed"
           '@ | Set-Content -Path $timerPath -Encoding UTF8
@@ -1174,64 +1176,66 @@ jobs:
           Write-Log "launched $browserName with $Url"
           '@ | Set-Content -Path $browserPath -Encoding UTF8
 
-          # User-session watchdog. MUST use -STA or WinForms overlay is invisible / dies.
           $watchPath = Join-Path $fabricRoot "SessionWatchdog.ps1"
+          $pwsh51 = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
           @"
           `$ErrorActionPreference = 'Continue'
           `$root = '$fabricRoot'
           `$url  = '$startupUrl'
           `$log  = Join-Path `$root 'launch.log'
+          `$ps   = Join-Path `$env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
           function W([string]`$m) { try { Add-Content `$log ("{0} [watch] {1}" -f (Get-Date -Format 'HH:mm:ss'), `$m) -Encoding ASCII } catch {} }
-          W ("watchdog session=" + [System.Diagnostics.Process]::GetCurrentProcess().SessionId)
-          if ([System.Diagnostics.Process]::GetCurrentProcess().SessionId -le 0) { W 'session 0 — exit'; return }
+          `$sid = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+          W ("watchdog session=`$sid user=`$env:USERNAME")
+          if (`$sid -le 0) { W 'session 0 — exit'; return }
           `$mx = New-Object System.Threading.Mutex(`$false, 'Local\RDPFabricSessionWatchdog')
           if (-not `$mx.WaitOne(0)) { W 'watchdog already running'; return }
+          function Get-EdgePath {
+              foreach (`$p in @(
+                  "`${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
+                  "`$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+                  "`$env:LOCALAPPDATA\Microsoft\Edge\Application\msedge.exe",
+                  "`$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
+              )) { if (Test-Path -LiteralPath `$p) { return `$p } }
+              return `$null
+          }
           function Start-Timer {
               `$alive = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
                   Where-Object { `$_.SessionId -gt 0 -and `$_.CommandLine -like '*FabricTimer.ps1*' -and `$_.CommandLine -notlike '*-Test*' }
               if (`$alive) { return }
               W 'start timer -STA'
-              Start-Process -FilePath "`$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList @('-NoProfile','-STA','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',(Join-Path `$root 'FabricTimer.ps1'))
+              Start-Process -FilePath `$ps -ArgumentList @('-NoProfile','-STA','-ExecutionPolicy','Bypass','-File',(Join-Path `$root 'FabricTimer.ps1'))
           }
           function Start-Browser {
               `$hostPart = 'fabric-x-xi'
               try { `$hostPart = ([System.Uri]`$url).Host } catch {}
-              `$edge = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+              `$open = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
                   `$_.SessionId -gt 0 -and `$_.Name -match 'msedge|chrome' -and `$_.CommandLine -like "*`$hostPart*"
               }
-              if (`$edge) { return }
-              W "start browser `$url"
-              Start-Process -FilePath "`$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',(Join-Path `$root 'BrowserOpen.ps1'),'-Url',`$url,'-Root',`$root)
+              if (`$open) { return }
+              `$edge = Get-EdgePath
+              W "start browser `$url via `$edge"
+              if (`$edge) { Start-Process -FilePath `$edge -ArgumentList @('--new-window','--no-first-run','--no-default-browser-check',`$url) }
+              else { Start-Process `$url }
           }
           Start-Timer
-          Start-Sleep 4
+          Start-Sleep 3
           Start-Browser
-          while (`$true) {
-              Start-Sleep 20
-              Start-Timer
-              Start-Browser
-          }
+          while (`$true) { Start-Sleep 15; Start-Timer; Start-Browser }
           "@ | Set-Content -Path $watchPath -Encoding UTF8
 
-          $timerCmd = Join-Path $fabricRoot "LaunchTimer.cmd"
+          $uxCmd = Join-Path $fabricRoot "Start-FabricUX.cmd"
           @"
           @echo off
-          start "" "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File "$timerPath"
-          start "" "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$watchPath"
-          "@ | Set-Content -Path $timerCmd -Encoding ASCII
-          $browserCmd = Join-Path $fabricRoot "LaunchBrowser.cmd"
-          @"
-          @echo off
-          start "" "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$browserPath" -Url "$startupUrl" -Root "$fabricRoot"
-          "@ | Set-Content -Path $browserCmd -Encoding ASCII
+          start "" "$pwsh51" -NoProfile -STA -ExecutionPolicy Bypass -File "$timerPath"
+          start "" "$pwsh51" -NoProfile -STA -ExecutionPolicy Bypass -File "$watchPath"
+          "@ | Set-Content -Path $uxCmd -Encoding ASCII
 
-          # Warm the FabricAdmin profile so Startup\ copies survive first logon.
-          try {
-              $sec = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
-              $cred = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$env:RDP_USER", $sec)
-              Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList '/c','exit' -Credential $cred -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null
-              Start-Sleep 2
-          } catch {}
+          $uxVbs = Join-Path $fabricRoot "Start-FabricUX.vbs"
+          @"
+          Set s = CreateObject("WScript.Shell")
+          s.Run "$pwsh51 -NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File $watchPath", 0, False
+          "@ | Set-Content -Path $uxVbs -Encoding ASCII
 
           foreach ($sd in @(
               "C:\Users\$env:RDP_USER\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup",
@@ -1239,30 +1243,62 @@ jobs:
               "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
           )) {
               if (-not (Test-Path -LiteralPath $sd)) { New-Item -ItemType Directory -Path $sd -Force | Out-Null }
-              Copy-Item -LiteralPath $timerCmd   -Destination (Join-Path $sd 'LaunchTimer.cmd')   -Force -ErrorAction SilentlyContinue
-              Copy-Item -LiteralPath $browserCmd -Destination (Join-Path $sd 'LaunchBrowser.cmd') -Force -ErrorAction SilentlyContinue
+              Copy-Item -LiteralPath $uxVbs -Destination (Join-Path $sd 'Start-FabricUX.vbs') -Force -ErrorAction SilentlyContinue
           }
 
-          New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Force | Out-Null
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "RDPFabric-Watch" -Value ('powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $watchPath) -Type String -Force
-          Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "RDPFabric-Timer" -Force -ErrorAction SilentlyContinue
+          foreach ($desk in @("C:\Users\Public\Desktop", "C:\Users\$env:RDP_USER\Desktop")) {
+              if (-not (Test-Path $desk)) { New-Item -ItemType Directory -Path $desk -Force | Out-Null }
+              Copy-Item $uxCmd (Join-Path $desk 'START TIMER + EDGE.cmd') -Force -ErrorAction SilentlyContinue
+              Set-Content -Path (Join-Path $desk 'Fabric App.url') -Value "[InternetShortcut]`r`nURL=$startupUrl`r`n" -Encoding ASCII -Force
+          }
 
-          # Active Setup: runs once in the *user* session on first interactive logon.
+          $runCmd = "$pwsh51 -NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$watchPath`""
+          New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Force | Out-Null
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "RDPFabric-Watch" -Value $runCmd -Type String -Force
+          New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run" -Force | Out-Null
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run" -Name "RDPFabric" -Value $runCmd -Type String -Force
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" -Name "NoRun" -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "Start_ShowRun" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+
           $as = "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A7F4C0E1-FAB1-4D11-9C00-00C0FFEE0001}"
           New-Item -Path $as -Force | Out-Null
           Set-ItemProperty -Path $as -Name "(default)" -Value "RDPFabric Session UX" -Force
-          Set-ItemProperty -Path $as -Name "StubPath" -Value ("powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$watchPath`"") -Force
-          Set-ItemProperty -Path $as -Name "Version" -Value "7,2,0,0" -Force
+          Set-ItemProperty -Path $as -Name "StubPath" -Value $runCmd -Force
+          Set-ItemProperty -Path $as -Name "Version" -Value "7,3,0,0" -Force
           Set-ItemProperty -Path $as -Name "IsInstalled" -Value 1 -Type DWord -Force
 
-          $wAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$watchPath`""
-          $wTrigger = New-ScheduledTaskTrigger -AtLogOn -User $taskUser
-          $wTrigger.Delay = "PT8S"
-          $prin = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Limited
-          $wSet = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
-          Register-ScheduledTask -TaskName "RDPFabric-SessionWatchdog" -Action $wAction -Trigger $wTrigger -Principal $prin -Settings $wSet -Force | Out-Null
+          # Write HKCU\...\Run into the user hive so Explorer starts UX on THIS user's RDP logon.
+          function Inject-UserRun([string]$ntuser) {
+              if (-not (Test-Path -LiteralPath $ntuser)) { return }
+              $null = & reg.exe load HKU\FabricHive $ntuser 2>&1
+              try {
+                  & reg.exe add "HKU\FabricHive\Software\Microsoft\Windows\CurrentVersion\Run" /v RDPFabricUX /t REG_SZ /d $runCmd /f | Out-Null
+                  & reg.exe add "HKU\FabricHive\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" /v NoStartupRun /t REG_DWORD /d 0 /f | Out-Null
+              } finally {
+                  [gc]::Collect(); Start-Sleep -Seconds 1
+                  $null = & reg.exe unload HKU\FabricHive 2>&1
+              }
+          }
+          Inject-UserRun "C:\Users\$env:RDP_USER\NTUSER.DAT"
+          Inject-UserRun "C:\Users\Default\NTUSER.DAT"
+
           Unregister-ScheduledTask -TaskName "RDPFabric-Timer" -Confirm:$false -ErrorAction SilentlyContinue
           Unregister-ScheduledTask -TaskName "RDPFabric-BrowserOpen" -Confirm:$false -ErrorAction SilentlyContinue
+          Unregister-ScheduledTask -TaskName "RDPFabric-SessionWatchdog" -Confirm:$false -ErrorAction SilentlyContinue
+          $wAction  = New-ScheduledTaskAction -Execute $pwsh51 -Argument "-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$watchPath`""
+          $wTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:RDP_USER
+          $wTrigger.Delay = "PT5S"
+          try {
+              Register-ScheduledTask -TaskName "RDPFabric-SessionWatchdog" -Action $wAction -Trigger $wTrigger -User $env:RDP_USER -Password $env:RDP_PASS -RunLevel Highest -Force | Out-Null
+              Write-Host "Logon task registered with stored password." -ForegroundColor Green
+          } catch {
+              $prin = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Highest
+              $wSet = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+              Register-ScheduledTask -TaskName "RDPFabric-SessionWatchdog" -Action $wAction -Trigger $wTrigger -Principal $prin -Settings $wSet -Force | Out-Null
+              Write-Host "Logon task registered without password store: $($_.Exception.Message)" -ForegroundColor Yellow
+          }
+          $wSet = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+          $prin = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Limited
 
           # ═══ SELF-TEST before anyone logs in ═══
           Write-Host "Self-testing embedded helper scripts..." -ForegroundColor Cyan
