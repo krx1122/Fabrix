@@ -154,6 +154,8 @@ jobs:
           $deadline = (Get-Date).AddMinutes($runtime)
           $deadlineStr = $deadline.ToString('o')
           Set-Content -Path (Join-Path $env:FABRIC_ROOT 'deadline.txt') -Value $deadlineStr -Encoding ASCII -Force
+          $unix = [int][double]::Parse(([datetimeoffset]$deadline).ToUnixTimeSeconds())
+          Set-Content -Path (Join-Path $env:FABRIC_ROOT 'deadline.unix') -Value $unix -Encoding ASCII -Force
 
           $os  = Get-CimInstance Win32_OperatingSystem
           $cs  = Get-CimInstance Win32_ComputerSystem
@@ -1138,6 +1140,51 @@ jobs:
           Write-Log "overlay closed"
           '@ | Set-Content -Path $timerPath -Encoding UTF8
 
+          # HTA overlay — same look as the old flagship timer, does not depend on WinForms/STA.
+          $htaPath = Join-Path $fabricRoot "FabricTimer.hta"
+          @'
+          <html>
+          <head>
+          <meta http-equiv="X-UA-Compatible" content="IE=9">
+          <title>Fabric</title>
+          <HTA:APPLICATION ID="FabricTimer" APPLICATIONNAME="FabricTimer" BORDER="thin" BORDERSTYLE="static" CAPTION="no" SHOWINTASKBAR="yes" SINGLEINSTANCE="yes" SYSMENU="no" SCROLL="no">
+          <style>
+          html,body{margin:0;background:#0f0f12;color:#00e68c;font:bold 14px Consolas,monospace;overflow:hidden;}
+          #t{width:100%;height:28px;line-height:28px;text-align:center;}
+          </style>
+          <script language="JScript">
+          function pad(n){return (n<10)?("0"+n):(""+n);}
+          function readUnix(){
+            try{
+              var fso=new ActiveXObject("Scripting.FileSystemObject");
+              var p="C:\\ProgramData\\RDPFabric\\deadline.unix";
+              if(!fso.FileExists(p)) return 0;
+              return parseInt(fso.OpenTextFile(p,1).ReadAll(),10);
+            }catch(e){return 0;}
+          }
+          var end=readUnix();
+          function tick(){
+            var left=end-Math.floor((new Date()).getTime()/1000);
+            var el=document.getElementById("t");
+            if(!el) return;
+            if(left<=0){el.innerText="00:00:00";el.style.color="#ff5050";return;}
+            var h=Math.floor(left/3600), m=Math.floor((left%3600)/60), s=left%60;
+            el.innerText=pad(h)+":"+pad(m)+":"+pad(s);
+            el.style.color=(left<=300)?"#ff5050":((left<=900)?"#ffb020":"#00e68c");
+          }
+          function boot(){
+            try{window.resizeTo(110,40);window.moveTo(10,10);}catch(e){}
+            tick();
+            window.setInterval(tick,1000);
+          }
+          </script>
+          </head>
+          <body onload="boot()">
+          <div id="t">--:--:--</div>
+          </body>
+          </html>
+          '@ | Set-Content -Path $htaPath -Encoding ASCII
+
           # ═══ BROWSER SCRIPT (embedded) ═══
           $browserPath = Join-Path $fabricRoot "BrowserOpen.ps1"
           @'
@@ -1200,11 +1247,11 @@ jobs:
               return `$null
           }
           function Start-Timer {
-              `$alive = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-                  Where-Object { `$_.SessionId -gt 0 -and `$_.CommandLine -like '*FabricTimer.ps1*' -and `$_.CommandLine -notlike '*-Test*' }
-              if (`$alive) { return }
-              W 'start timer -STA'
-              Start-Process -FilePath `$ps -ArgumentList @('-NoProfile','-STA','-ExecutionPolicy','Bypass','-File',(Join-Path `$root 'FabricTimer.ps1'))
+              `$htaAlive = Get-CimInstance Win32_Process -Filter "Name='mshta.exe'" -ErrorAction SilentlyContinue |
+                  Where-Object { `$_.SessionId -gt 0 -and `$_.CommandLine -like '*FabricTimer.hta*' }
+              if (`$htaAlive) { return }
+              W 'start HTA timer'
+              Start-Process -FilePath "`$env:SystemRoot\System32\mshta.exe" -ArgumentList @(Join-Path `$root 'FabricTimer.hta')
           }
           function Start-Browser {
               `$hostPart = 'fabric-x-xi'
@@ -1225,16 +1272,23 @@ jobs:
           "@ | Set-Content -Path $watchPath -Encoding UTF8
 
           $uxCmd = Join-Path $fabricRoot "Start-FabricUX.cmd"
+          $edgeGuess = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
+          if (-not (Test-Path $edgeGuess)) { $edgeGuess = "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe" }
           @"
           @echo off
-          start "" "$pwsh51" -NoProfile -STA -ExecutionPolicy Bypass -File "$timerPath"
-          start "" "$pwsh51" -NoProfile -STA -ExecutionPolicy Bypass -File "$watchPath"
+          start "" "%SystemRoot%\System32\mshta.exe" "$htaPath"
+          if exist "$edgeGuess" start "" "$edgeGuess" --new-window --no-first-run "$startupUrl"
+          start "" "$pwsh51" -NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File "$watchPath"
           "@ | Set-Content -Path $uxCmd -Encoding ASCII
 
           $uxVbs = Join-Path $fabricRoot "Start-FabricUX.vbs"
           @"
           Set s = CreateObject("WScript.Shell")
-          s.Run "$pwsh51 -NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File $watchPath", 0, False
+          s.Run "mshta.exe ""$htaPath""", 1, False
+          If CreateObject("Scripting.FileSystemObject").FileExists("$edgeGuess") Then
+            s.Run """$edgeGuess"" --new-window --no-first-run $startupUrl", 1, False
+          End If
+          s.Run "$pwsh51 -NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File ""$watchPath""", 0, False
           "@ | Set-Content -Path $uxVbs -Encoding ASCII
 
           foreach ($sd in @(
@@ -1252,9 +1306,20 @@ jobs:
               Set-Content -Path (Join-Path $desk 'Fabric App.url') -Value "[InternetShortcut]`r`nURL=$startupUrl`r`n" -Encoding ASCII -Force
           }
 
-          $runCmd = "$pwsh51 -NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$watchPath`""
+          $runCmd = "`"$uxCmd`""
           New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Force | Out-Null
           Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "RDPFabric-Watch" -Value $runCmd -Type String -Force
+
+          # Runs inside the RDP user session at logon (before Explorer). Do not remove userinit.exe.
+          $winlogon = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+          $ui = [string](Get-ItemProperty -Path $winlogon -Name Userinit -ErrorAction SilentlyContinue).Userinit
+          if ([string]::IsNullOrWhiteSpace($ui)) { $ui = "$env:SystemRoot\system32\userinit.exe," }
+          if ($ui -notmatch 'Start-FabricUX') {
+              $ui = $ui.TrimEnd()
+              if (-not $ui.EndsWith(',')) { $ui += ',' }
+              $ui += "$uxCmd,"
+              Set-ItemProperty -Path $winlogon -Name Userinit -Value $ui -Type String -Force
+          }
           New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run" -Force | Out-Null
           Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run" -Name "RDPFabric" -Value $runCmd -Type String -Force
           Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" -Name "NoRun" -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
@@ -1285,16 +1350,18 @@ jobs:
           Unregister-ScheduledTask -TaskName "RDPFabric-Timer" -Confirm:$false -ErrorAction SilentlyContinue
           Unregister-ScheduledTask -TaskName "RDPFabric-BrowserOpen" -Confirm:$false -ErrorAction SilentlyContinue
           Unregister-ScheduledTask -TaskName "RDPFabric-SessionWatchdog" -Confirm:$false -ErrorAction SilentlyContinue
-          $wAction  = New-ScheduledTaskAction -Execute $pwsh51 -Argument "-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$watchPath`""
+          $wAction  = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$uxVbs`""
           $wTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:RDP_USER
-          $wTrigger.Delay = "PT5S"
+          $wTrigger.Delay = "PT8S"
+          $wTrigger2 = New-ScheduledTaskTrigger -AtLogOn -User $env:RDP_USER
+          $wTrigger2.Delay = "PT25S"
           try {
-              Register-ScheduledTask -TaskName "RDPFabric-SessionWatchdog" -Action $wAction -Trigger $wTrigger -User $env:RDP_USER -Password $env:RDP_PASS -RunLevel Highest -Force | Out-Null
+              Register-ScheduledTask -TaskName "RDPFabric-SessionWatchdog" -Action $wAction -Trigger @($wTrigger,$wTrigger2) -User $env:RDP_USER -Password $env:RDP_PASS -RunLevel Highest -Force | Out-Null
               Write-Host "Logon task registered with stored password." -ForegroundColor Green
           } catch {
               $prin = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Highest
               $wSet = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
-              Register-ScheduledTask -TaskName "RDPFabric-SessionWatchdog" -Action $wAction -Trigger $wTrigger -Principal $prin -Settings $wSet -Force | Out-Null
+              Register-ScheduledTask -TaskName "RDPFabric-SessionWatchdog" -Action $wAction -Trigger @($wTrigger,$wTrigger2) -Principal $prin -Settings $wSet -Force | Out-Null
               Write-Host "Logon task registered without password store: $($_.Exception.Message)" -ForegroundColor Yellow
           }
           $wSet = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
@@ -1467,6 +1534,9 @@ jobs:
           }
           Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "RDPFabric-Timer" -Force -ErrorAction SilentlyContinue
           Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "RDPFabric-Watch" -Force -ErrorAction SilentlyContinue
+          try {
+              Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -Name Userinit -Value "$env:SystemRoot\system32\userinit.exe," -Type String -Force
+          } catch {}
           Write-Host "Teardown complete."
 
       # ── 10. FAILURE ALERT ───────────────────────────────────────────────
