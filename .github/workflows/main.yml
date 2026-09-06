@@ -1174,19 +1174,65 @@ jobs:
           Write-Log "launched $browserName with $Url"
           '@ | Set-Content -Path $browserPath -Encoding UTF8
 
-          # ═══ .cmd launchers (direct PowerShell — NO VBS) ═══
+          # User-session watchdog. MUST use -STA or WinForms overlay is invisible / dies.
+          $watchPath = Join-Path $fabricRoot "SessionWatchdog.ps1"
+          @"
+          `$ErrorActionPreference = 'Continue'
+          `$root = '$fabricRoot'
+          `$url  = '$startupUrl'
+          `$log  = Join-Path `$root 'launch.log'
+          function W([string]`$m) { try { Add-Content `$log ("{0} [watch] {1}" -f (Get-Date -Format 'HH:mm:ss'), `$m) -Encoding ASCII } catch {} }
+          W ("watchdog session=" + [System.Diagnostics.Process]::GetCurrentProcess().SessionId)
+          if ([System.Diagnostics.Process]::GetCurrentProcess().SessionId -le 0) { W 'session 0 — exit'; return }
+          `$mx = New-Object System.Threading.Mutex(`$false, 'Local\RDPFabricSessionWatchdog')
+          if (-not `$mx.WaitOne(0)) { W 'watchdog already running'; return }
+          function Start-Timer {
+              `$alive = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+                  Where-Object { `$_.SessionId -gt 0 -and `$_.CommandLine -like '*FabricTimer.ps1*' -and `$_.CommandLine -notlike '*-Test*' }
+              if (`$alive) { return }
+              W 'start timer -STA'
+              Start-Process -FilePath "`$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList @('-NoProfile','-STA','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',(Join-Path `$root 'FabricTimer.ps1'))
+          }
+          function Start-Browser {
+              `$hostPart = 'fabric-x-xi'
+              try { `$hostPart = ([System.Uri]`$url).Host } catch {}
+              `$edge = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+                  `$_.SessionId -gt 0 -and `$_.Name -match 'msedge|chrome' -and `$_.CommandLine -like "*`$hostPart*"
+              }
+              if (`$edge) { return }
+              W "start browser `$url"
+              Start-Process -FilePath "`$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',(Join-Path `$root 'BrowserOpen.ps1'),'-Url',`$url,'-Root',`$root)
+          }
+          Start-Timer
+          Start-Sleep 4
+          Start-Browser
+          while (`$true) {
+              Start-Sleep 20
+              Start-Timer
+              Start-Browser
+          }
+          "@ | Set-Content -Path $watchPath -Encoding UTF8
+
           $timerCmd = Join-Path $fabricRoot "LaunchTimer.cmd"
           @"
           @echo off
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$timerPath"
+          start "" "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File "$timerPath"
+          start "" "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$watchPath"
           "@ | Set-Content -Path $timerCmd -Encoding ASCII
           $browserCmd = Join-Path $fabricRoot "LaunchBrowser.cmd"
           @"
           @echo off
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$browserPath" -Url "$startupUrl" -Root "$fabricRoot"
+          start "" "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$browserPath" -Url "$startupUrl" -Root "$fabricRoot"
           "@ | Set-Content -Path $browserCmd -Encoding ASCII
 
-          # 3x Startup folders (covers first-RDP-login race)
+          # Warm the FabricAdmin profile so Startup\ copies survive first logon.
+          try {
+              $sec = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
+              $cred = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$env:RDP_USER", $sec)
+              Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList '/c','exit' -Credential $cred -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null
+              Start-Sleep 2
+          } catch {}
+
           foreach ($sd in @(
               "C:\Users\$env:RDP_USER\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup",
               "C:\Users\Default\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup",
@@ -1197,26 +1243,30 @@ jobs:
               Copy-Item -LiteralPath $browserCmd -Destination (Join-Path $sd 'LaunchBrowser.cmd') -Force -ErrorAction SilentlyContinue
           }
 
-          # HKLM Run (timer for ANY interactive logon)
           New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Force | Out-Null
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "RDPFabric-Timer" -Value ('"{0}"' -f $timerCmd) -Type String -Force
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "RDPFabric-Watch" -Value ('powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $watchPath) -Type String -Force
+          Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "RDPFabric-Timer" -Force -ErrorAction SilentlyContinue
 
-          # Scheduled tasks
-          $tmAction  = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$timerPath`""
-          $bAction   = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$browserPath`" -Url `"$startupUrl`" -Root `"$fabricRoot`""
-          $tmTrigger = New-ScheduledTaskTrigger -AtLogOn -User $taskUser
-          $tmTrigger.Delay = "PT5S"
-          $bTrigger  = New-ScheduledTaskTrigger -AtLogOn -User $taskUser
-          $bTrigger.Delay  = "PT10S"
+          # Active Setup: runs once in the *user* session on first interactive logon.
+          $as = "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A7F4C0E1-FAB1-4D11-9C00-00C0FFEE0001}"
+          New-Item -Path $as -Force | Out-Null
+          Set-ItemProperty -Path $as -Name "(default)" -Value "RDPFabric Session UX" -Force
+          Set-ItemProperty -Path $as -Name "StubPath" -Value ("powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$watchPath`"") -Force
+          Set-ItemProperty -Path $as -Name "Version" -Value "7,2,0,0" -Force
+          Set-ItemProperty -Path $as -Name "IsInstalled" -Value 1 -Type DWord -Force
+
+          $wAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$watchPath`""
+          $wTrigger = New-ScheduledTaskTrigger -AtLogOn -User $taskUser
+          $wTrigger.Delay = "PT8S"
           $prin = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Limited
-          $tSet = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-          $bSet = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew
-          Register-ScheduledTask -TaskName "RDPFabric-Timer"    -Action $tmAction -Trigger $tmTrigger -Principal $prin -Settings $tSet -Force | Out-Null
-          Register-ScheduledTask -TaskName "RDPFabric-BrowserOpen" -Action $bAction -Trigger $bTrigger -Principal $prin -Settings $bSet -Force | Out-Null
+          $wSet = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+          Register-ScheduledTask -TaskName "RDPFabric-SessionWatchdog" -Action $wAction -Trigger $wTrigger -Principal $prin -Settings $wSet -Force | Out-Null
+          Unregister-ScheduledTask -TaskName "RDPFabric-Timer" -Confirm:$false -ErrorAction SilentlyContinue
+          Unregister-ScheduledTask -TaskName "RDPFabric-BrowserOpen" -Confirm:$false -ErrorAction SilentlyContinue
 
           # ═══ SELF-TEST before anyone logs in ═══
           Write-Host "Self-testing embedded helper scripts..." -ForegroundColor Cyan
-          $tTest = Start-Process -FilePath "powershell.exe" -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$timerPath`"",'-Test') -PassThru -Wait -ErrorAction SilentlyContinue
+          $tTest = Start-Process -FilePath "powershell.exe" -ArgumentList @('-NoProfile','-STA','-ExecutionPolicy','Bypass','-File',"`"$timerPath`"",'-Test') -PassThru -Wait -ErrorAction SilentlyContinue
           Write-Host ("Timer   self-test exit={0}" -f $(if($tTest){$tTest.ExitCode}else{'n/a'})) -ForegroundColor Green
           $bTest = Start-Process -FilePath "powershell.exe" -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$browserPath`"",'-Test','-Root',"`"$fabricRoot`"") -PassThru -Wait -ErrorAction SilentlyContinue
           Write-Host ("Browser self-test exit={0}" -f $(if($bTest){$bTest.ExitCode}else{'n/a'})) -ForegroundColor Green
@@ -1239,9 +1289,9 @@ jobs:
           $tAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$hkcuPath`""
           $tTrigger = New-ScheduledTaskTrigger -AtLogOn -User $taskUser
           $tTrigger.Delay = "PT3S"
-          Register-ScheduledTask -TaskName "RDPFabric-UserTweaks" -Action $tAction -Trigger $tTrigger -Principal $prin -Settings $bSet -Force | Out-Null
+          Register-ScheduledTask -TaskName "RDPFabric-UserTweaks" -Action $tAction -Trigger $tTrigger -Principal $prin -Settings $wSet -Force | Out-Null
 
-          Write-Host "Timer + Browser armed (.cmd + Run key + tasks + watchdog). Drop: $drop | Dumps: $dumps" -ForegroundColor Green
+          Write-Host "Timer + Browser armed (STA watchdog in user session). Drop: $drop | Dumps: $dumps" -ForegroundColor Green
 
       # ── 8. HOLD + GOVERNOR + SESSION-AWARE WATCHDOG + CYCLE ────────────
       - name: "Phase 8: Session Hold, Self-Healing Governor & Cycle Handoff"
@@ -1320,25 +1370,9 @@ jobs:
                       ForEach-Object { Unblock-File -LiteralPath $_.FullName -ErrorAction SilentlyContinue }
               }
 
-              # Session-aware relaunch: any interactive desktop (explorer in session > 0)
-              $interactive = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue |
-                  Where-Object { $_.SessionId -gt 0 }
-              if ($interactive) {
-                  $tAlive = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-                      Where-Object { $_.CommandLine -like '*FabricTimer.ps1*' }
-                  if (-not $tAlive) {
-                      Write-Host "Timer overlay missing in active session — relaunching..." -ForegroundColor Yellow
-                      try { Start-ScheduledTask -TaskName 'RDPFabric-Timer' -ErrorAction Stop } catch { & schtasks /run /tn 'RDPFabric-Timer' 2>$null | Out-Null }
-                  }
-                  if (($tick % 3) -eq 0) {
-                      $bAlive = Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue |
-                          Where-Object { $_.CommandLine -like "*$urlHost*" }
-                      if (-not $bAlive) {
-                          Write-Host "Browser window missing — relaunching..." -ForegroundColor Yellow
-                          try { Start-ScheduledTask -TaskName 'RDPFabric-BrowserOpen' -ErrorAction Stop } catch { & schtasks /run /tn 'RDPFabric-BrowserOpen' 2>$null | Out-Null }
-                      }
-                  }
-              }
+              # Do NOT Start-ScheduledTask GUI jobs from this Actions session (Session 0).
+              # That spawned invisible overlays and stole nothing useful. User-session
+              # SessionWatchdog.ps1 relaunches timer + browser after RDP logon.
 
               # Re-assert Defender/Update off every 5 min
               if (($tick % 10) -eq 0) {
@@ -1392,10 +1426,11 @@ jobs:
           $ErrorActionPreference = 'SilentlyContinue'
           $tsPath = "C:\Program Files\Tailscale\tailscale.exe"
           if (Test-Path -LiteralPath $tsPath) { Write-Host "Logging out of Tailnet..."; & $tsPath logout 2>$null | Out-Null }
-          foreach ($t in 'RDPFabric-Timer','RDPFabric-BrowserOpen','RDPFabric-UserTweaks','RDPFabric-UserNetTweaks') {
+          foreach ($t in 'RDPFabric-Timer','RDPFabric-BrowserOpen','RDPFabric-SessionWatchdog','RDPFabric-UserTweaks','RDPFabric-UserNetTweaks') {
               Unregister-ScheduledTask -TaskName $t -Confirm:$false -ErrorAction SilentlyContinue
           }
           Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "RDPFabric-Timer" -Force -ErrorAction SilentlyContinue
+          Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "RDPFabric-Watch" -Force -ErrorAction SilentlyContinue
           Write-Host "Teardown complete."
 
       # ── 10. FAILURE ALERT ───────────────────────────────────────────────
